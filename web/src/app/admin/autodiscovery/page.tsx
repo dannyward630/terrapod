@@ -1,6 +1,11 @@
 'use client'
 
 import { useEffect, useState, useCallback } from 'react'
+import {
+  EE_UNKNOWN,
+  fetchAnsibleExecutionEnvironments,
+  type AnsibleExecutionEnvironments,
+} from '@/lib/ansible-ee'
 import { useRouter } from 'next/navigation'
 import { useTranslations } from 'next-intl'
 import NavBar from '@/components/nav-bar'
@@ -45,6 +50,7 @@ interface AutodiscoveryRule {
     'agent-pool-id': string | null
     'terraform-version': string
     'ansible-version'?: string
+    'ansible-execution-environment'?: string
     'ansible-collections'?: { name: string; version?: string }[]
     // Which operations a materialised workspace has (#1966), and the roots
     // each one uses (#1929). `configure-enabled` defaults false, so a rule
@@ -154,6 +160,8 @@ export default function AutodiscoveryPage() {
   // happened to be the day it was created -- which is the thing that goes
   // stale. An operator who wants a pin types one.
   const [ansibleVersion, setAnsibleVersion] = useState('')
+  const [ansibleEE, setAnsibleEE] = useState('')
+  const [envs, setEnvs] = useState<AnsibleExecutionEnvironments>(EE_UNKNOWN)
   const [ansibleCollections, setAnsibleCollections] = useState<string[]>([])
   // Which operations every workspace this rule materialises has (#1966).
   // These initial values are the model's own column defaults, so a rule
@@ -284,6 +292,9 @@ export default function AutodiscoveryPage() {
         fetchAllPages<ExecutionHookRef>('/api/terrapod/v1/execution-hooks').catch(() => [] as ExecutionHookRef[]),
       ])
       setRules(rulesList)
+      // Non-fatal like the pickers above, and its own call because it needs
+      // `meta.listing` -- which `fetchAllPages` discards.
+      void fetchAnsibleExecutionEnvironments().then(setEnvs)
       setConnections(connsList)
       setPools(poolsList)
       setHooks(hooksList)
@@ -309,6 +320,7 @@ export default function AutodiscoveryPage() {
     setExecutionBackend('tofu')
     setTerraformVersion('1.13')
     setAnsibleVersion('')
+    setAnsibleEE('')
     // Back to the model's column defaults (#1966), which is what a brand-new
     // rule means by not mentioning them.
     setPlanApplyEnabled(true)
@@ -368,6 +380,7 @@ export default function AutodiscoveryPage() {
     setExecutionBackend((a['execution-backend'] as 'tofu' | 'terraform') || 'tofu')
     setTerraformVersion(a['terraform-version'])
     setAnsibleVersion(a['ansible-version'] || '')
+    setAnsibleEE(a['ansible-execution-environment'] || '')
     setAnsibleCollections(formatCollectionLines(a['ansible-collections']))
     // `?? default` rather than `|| default` on both booleans: a stored `false`
     // is a value, and `||` would read it as absent and seed the column default
@@ -447,6 +460,7 @@ export default function AutodiscoveryPage() {
       'agent-pool-id': agentPoolId || null,
       'engine-version': terraformVersion,
       'ansible-version': ansibleVersion.trim(),
+      'ansible-execution-environment': ansibleEE.trim(),
       'ansible-collections': parseCollectionLines(ansibleCollections),
       // Which operations the materialised workspaces have (#1966). Always
       // sent, like every other attribute in this form: the rule holds a
@@ -832,12 +846,60 @@ export default function AutodiscoveryPage() {
                   >
                     {tWs('fields.ansibleVersion')}
                   </label>
-                  <input
-                    value={ansibleVersion}
-                    onChange={e => setAnsibleVersion(e.target.value)}
-                    placeholder={tWs('fields.ansibleVersionPlaceholder')}
+                  {envs.listing === 'complete' && envs.lines.length > 0 ? (
+                    <select
+                      data-testid="rule-ansible-version"
+                      value={ansibleVersion}
+                      onChange={e => setAnsibleVersion(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm"
+                    >
+                      <option value="">{t('form.none')}</option>
+                      {envs.lines.map(l => (
+                        <option key={l} value={l}>{l}</option>
+                      ))}
+                    </select>
+                  ) : (
+                    /* `unknown` means the server accepts ANY line, so a free-text
+                       input is correct here -- an empty picker would block work
+                       the server would have allowed. */
+                    <input
+                      data-testid="rule-ansible-version"
+                      value={ansibleVersion}
+                      onChange={e => setAnsibleVersion(e.target.value)}
+                      placeholder={tWs('fields.ansibleVersionPlaceholder')}
+                      title={tWs('fields.ansibleVersionUnconfirmed')}
+                      className="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm"
+                    />
+                  )}
+                </div>
+                <div>
+                  <label
+                    className="block text-sm text-slate-300 mb-1"
+                    title={tWs('fields.ansibleExecutionEnvironmentTitle')}
+                  >
+                    {tWs('fields.ansibleExecutionEnvironment')}
+                  </label>
+                  {/* Always a picker: operator labels come from configuration,
+                      not from a registry, so they are authoritative even when the
+                      built-in listing is unknown. A label the deployment has not
+                      configured is refused at the write, so there is nothing to
+                      gain from letting one be typed. */}
+                  <select
+                    data-testid="rule-ansible-ee"
+                    value={ansibleEE}
+                    onChange={e => setAnsibleEE(e.target.value)}
+                    disabled={envs.labels.length === 0}
                     className="w-full bg-slate-950 border border-slate-700 rounded px-3 py-2 text-sm"
-                  />
+                  >
+                    <option value="">
+                      {envs.labels.length === 0
+                        ? tWs('fields.ansibleExecutionEnvironmentNone')
+                        : t('form.none')}
+                    </option>
+                    {envs.labels.map(l => (
+                      <option key={l} value={l}>{l}</option>
+                    ))}
+                  </select>
                 </div>
                 <div>
                   <label className="block text-sm text-slate-300 mb-1">{t('form.cpuRequest')}</label>

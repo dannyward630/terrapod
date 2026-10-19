@@ -1,6 +1,11 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import {
+  EE_UNKNOWN,
+  fetchAnsibleExecutionEnvironments,
+  type AnsibleExecutionEnvironments,
+} from '@/lib/ansible-ee'
 import { useRouter } from 'next/navigation'
 import { useTranslations } from 'next-intl'
 import NavBar from '@/components/nav-bar'
@@ -112,6 +117,8 @@ export default function BulkUpdatePage() {
   // ---- Update form state ----
   const [uTfVersion, setUTfVersion] = useState('')
   const [uAnsibleVersion, setUAnsibleVersion] = useState('')
+  const [uAnsibleEE, setUAnsibleEE] = useState('')
+  const [envs, setEnvs] = useState<AnsibleExecutionEnvironments>(EE_UNKNOWN)
   // Which operations the matched workspaces have (#1966). Tri-state
   // '' | 'true' | 'false', as terragrunt-enabled below: a plain checkbox
   // cannot say "leave this alone", and the endpoint type-checks booleans
@@ -236,6 +243,9 @@ export default function BulkUpdatePage() {
       ])
       setPools(poolsList)
       setConnections(connsList)
+      // Its own call rather than `fetchAllPages`, which discards the `meta`
+      // this needs; non-fatal like the two above.
+      void fetchAnsibleExecutionEnvironments().then(setEnvs)
     } catch {
       // refs are convenience-only; the page still works with manual ids
     } finally {
@@ -262,6 +272,7 @@ export default function BulkUpdatePage() {
     // keeps the UI off a deprecated spelling.
     if (uTfVersion.trim()) u['engine-version'] = uTfVersion.trim()
     if (uAnsibleVersion.trim()) u['ansible-version'] = uAnsibleVersion.trim()
+    if (uAnsibleEE.trim()) u['ansible-execution-environment'] = uAnsibleEE.trim()
     // Which operations the matched workspaces have (#1966). Either may be sent
     // on its own: the endpoint checks the MERGE against each matched
     // workspace's own row, so turning plan/apply off is legitimate across a set
@@ -629,13 +640,53 @@ export default function BulkUpdatePage() {
               <label className={labelCls} title={tWs('fields.ansibleVersionTitle')}>
                 {tWs('fields.ansibleVersion')}
               </label>
-              <input
-                type="text"
-                value={uAnsibleVersion}
-                onChange={(e) => setUAnsibleVersion(e.target.value)}
-                placeholder={t('unchanged')}
+              {envs.listing === 'complete' && envs.lines.length > 0 ? (
+                <select
+                  value={uAnsibleVersion}
+                  onChange={(e) => setUAnsibleVersion(e.target.value)}
+                  className={inputCls}
+                >
+                  <option value="">{t('unchangedOption')}</option>
+                  {envs.lines.map((l) => (
+                    <option key={l} value={l}>{l}</option>
+                  ))}
+                </select>
+              ) : (
+                /* `unknown` means the server accepts ANY line, so free text is
+                   correct -- an empty picker would block a fleet move the server
+                   would have allowed. */
+                <input
+                  type="text"
+                  value={uAnsibleVersion}
+                  onChange={(e) => setUAnsibleVersion(e.target.value)}
+                  placeholder={t('unchanged')}
+                  title={tWs('fields.ansibleVersionUnconfirmed')}
+                  className={inputCls}
+                />
+              )}
+            </div>
+            <div>
+              <label className={labelCls} title={tWs('fields.ansibleExecutionEnvironmentTitle')}>
+                {tWs('fields.ansibleExecutionEnvironment')}
+              </label>
+              {/* Always a picker: operator labels come from configuration, not
+                  from a registry, so they are authoritative even when the
+                  built-in listing is unknown. */}
+              <select
+                value={uAnsibleEE}
+                onChange={(e) => setUAnsibleEE(e.target.value)}
+                disabled={envs.labels.length === 0}
                 className={inputCls}
-              />
+              >
+                <option value="">
+                  {envs.labels.length === 0
+                    ? tWs('fields.ansibleExecutionEnvironmentNone')
+                    : t('unchangedOption')}
+                </option>
+                {envs.labels.map((l) => (
+                  <option key={l} value={l}>{l}</option>
+                ))}
+              </select>
             </div>
             <div>
               <label className={labelCls}>{t('update.executionBackend')}</label>

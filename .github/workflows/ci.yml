@@ -584,7 +584,7 @@ jobs:
             # Root-level tests/*.py are NOT auto-collected by the directory
             # shards below — each must be listed here explicitly, or it silently
             # never runs in CI. All of these are pure-unit (no Postgres/Redis/S3).
-            paths: tests/auth tests/meta tests/runner tests/storage tests/ai_eval tests/config tests/db tests/helm tests/oci tests/test_logging_config.py tests/test_dependency_pins.py tests/test_ansible_is_baked.py tests/test_api_sdk_contract.py tests/test_schema_version.py tests/test_gpg_verify.py tests/test_http_retry.py tests/test_db_iam_auth.py tests/test_redis_iam_auth.py tests/crypto tests/test_ha_config.py
+            paths: tests/auth tests/meta tests/runner tests/storage tests/ai_eval tests/config tests/db tests/helm tests/oci tests/test_logging_config.py tests/test_dependency_pins.py tests/test_ansible_is_baked.py tests/test_ee_image_resolution.py tests/test_api_sdk_contract.py tests/test_schema_version.py tests/test_gpg_verify.py tests/test_http_retry.py tests/test_db_iam_auth.py tests/test_redis_iam_auth.py tests/crypto tests/test_ha_config.py
             pytest_args: -n auto
           # services-api is sharded across three runners as well as run under
           # xdist within each. One job took ~8.5 min (#1555): ~6 min of pytest
@@ -1089,6 +1089,17 @@ jobs:
       # and v7 at once, and is v7.
       - name: Pinned actions agree on their version comments
         run: python3 scripts/docs-audit/check_action_pins.py
+      # A job that downloads an artifact must depend on the job producing it.
+      # Without that the two are only ordered by the scheduler, so the job is
+      # green until the ordering goes the other way -- which is how the runner
+      # image build failed on arm64 and passed on amd64 in the same run.
+      # The only gate here with a dependency. Installed explicitly rather
+      # than assumed: every other job in this file that needs PyYAML installs
+      # it, which is evidence enough that the runner image is not relied on to
+      # carry it.
+      - run: pip install pyyaml
+      - name: Downloaded artifacts come from a declared dependency
+        run: python3 scripts/docs-audit/check_artifact_deps.py
       # Advisory: prints for human review, never fails. Telling a factual
       # boundary from a put-down is a judgement call.
       - name: Peer-fairness review list
@@ -1800,6 +1811,18 @@ jobs:
           echo "$out" | grep -q "ee_startup_timeout_seconds: 600" || { echo "FAIL: runners.yaml ee_startup_timeout_seconds not rendered — a stalled execution environment would hang to the stale timeout with the operator's window ignored"; exit 1; }
           echo "$out" | grep -q 'default_ee_resource_cpu: "500m"' || { echo "FAIL: config.yaml default_ee_resource_cpu not rendered — a workspace that sizes no EE would take the code default, ignoring the operator's"; exit 1; }
           echo "$out" | grep -q 'default_ee_resource_memory: "1Gi"' || { echo "FAIL: config.yaml default_ee_resource_memory not rendered"; exit 1; }
+          # Which environments are selectable (#2154). The repository is what a
+          # kubelet pulls and what the availability read lists, so a missing
+          # render line leaves the code default winning while the operator's
+          # own mirror is ignored -- and in a restricted network that means
+          # every configure fails on an image it cannot reach. The TTL bounds a
+          # mutable tag listing; without it a newly published line could never
+          # be selected.
+          echo "$out" | grep -q 'ee_repository: "ghcr.io/mattrobinsonsre/terrapod-ee"' || { echo "FAIL: config.yaml ansible.ee_repository not rendered — an operator pointing at their own mirror would be silently ignored"; exit 1; }
+          echo "$out" | grep -q "availability_ttl_seconds: 300" || { echo "FAIL: config.yaml ansible.availability_ttl_seconds not rendered"; exit 1; }
+          # Empty by default, so nothing should render -- an operator-supplied
+          # environment is opt-in and must not appear from nowhere.
+          echo "$out" | grep -q "execution_environments:" && { echo "FAIL: ansible.execution_environments rendered while empty"; exit 1; }
           # Slack integration (#556) is OFF by default: config renders but no
           # secret env is injected (no existingSecret) — config-channel contract.
           echo "$out" | grep -q "TERRAPOD_SLACK__" && { echo "FAIL: Slack secret env injected when disabled"; exit 1; }
@@ -2846,7 +2869,7 @@ jobs:
   # artifacted on PRs so scan-images can scan it.
   build-images-amd64:
     name: Build ${{ matrix.image }} (amd64)
-    needs: [prepare, build-query]
+    needs: [prepare, build-query, build-ee-agent]
     if: needs.prepare.outputs.images_exist != 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -2945,7 +2968,7 @@ jobs:
 
   build-images-arm64:
     name: Build ${{ matrix.image }} (arm64)
-    needs: [prepare, build-query]
+    needs: [prepare, build-query, build-ee-agent]
     if: needs.prepare.outputs.images_exist != 'true'
     runs-on: ubuntu-24.04-arm
     permissions:

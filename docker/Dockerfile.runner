@@ -133,6 +133,9 @@ COPY services/terrapod/runner/runner_config.py ./terrapod/runner/runner_config.p
 COPY services/terrapod/runner/download.py ./terrapod/runner/download.py
 COPY services/terrapod/runner/reserved_env.py ./terrapod/runner/reserved_env.py
 COPY services/terrapod/runner/exec_subprocess.py ./terrapod/runner/exec_subprocess.py
+# How the configure phase runs ansible: in the execution-environment container
+# beside this one, over loopback (#1972). The orchestrator ships no ansible.
+COPY services/terrapod/runner/ee_client.py ./terrapod/runner/ee_client.py
 COPY services/terrapod/runner/debug_linger.py ./terrapod/runner/debug_linger.py
 COPY services/terrapod/runner/lock_extender.py ./terrapod/runner/lock_extender.py
 COPY services/terrapod/runner/plan_artifacts.py ./terrapod/runner/plan_artifacts.py
@@ -143,6 +146,11 @@ COPY services/terrapod/runner/phases/ ./terrapod/runner/phases/
 # so it fits the minimal runner image with no new deps. terrapod.services is a
 # namespace package here (only the cost subpackage is copied in).
 COPY services/terrapod/services/cost/ ./terrapod/services/cost/
+# The inventory renderer, shared with the API so a configure's inventory is
+# rendered by ONE implementation on both sides (#1972). Pure -- yaml only --
+# which is what lets it come as one file rather than dragging the resolver's
+# database and storage dependencies into this image.
+COPY services/terrapod/services/inventory_render.py ./terrapod/services/inventory_render.py
 
 # /home/runner is the writable HOME for UID 1000, and UID 1000 gets a real
 # /etc/passwd entry. The passwd entry matters twice over:

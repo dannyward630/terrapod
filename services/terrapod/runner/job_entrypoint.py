@@ -44,8 +44,11 @@ import structlog
 
 from terrapod.runner import debug_linger, lock_extender, plan_artifacts
 from terrapod.runner.phases import (
+    ansible_collections,
     backend_backstop,
     cloud_identity,
+    configure,
+    configure_inventory,
     cost,
     discovery,
     execution_hooks,
@@ -86,6 +89,7 @@ _COMBINED_LOG = Path("/tmp/combined.log")
 _INIT_LOG = Path("/tmp/init.log")
 _PLAN_LOG = Path("/tmp/plan.log")
 _APPLY_LOG = Path("/tmp/apply.log")
+_CONFIGURE_LOG = Path("/tmp/configure.log")
 _PLAN_JSON = Path("/tmp/plan.json")
 _TF_RC = Path("/tmp/terraform.rc")
 _OPA_WORK = Path("/tmp/opa")
@@ -804,6 +808,21 @@ def _run_body(cfg: RunnerConfig, work_dir: Path) -> int:
     if os.environ.get("TP_ENGINE", "") == "pulumi":
         return _run_pulumi_phase(cfg, child_grace=_child_grace_seconds(cfg))
 
+    # 7c. A configure runs here, for the same reason and with the same boundary
+    # (#1972). It keeps what 7b keeps -- the configuration tarball, the chdir,
+    # private-git-module auth for a git-sourced role, and the operator's hooks --
+    # and skips what is Terraform's alone. The steps below would not merely fail
+    # to apply: step 10's backend backstop raises when `.terraform/terraform.tfstate`
+    # is MISSING, which is exactly what a directory of playbooks leaves behind,
+    # so a configure branching at step 11 would die before reaching ansible with
+    # advice about a committed `override.tf`.
+    #
+    # It is a THIRD branch rather than a phase of the apply because a configure is
+    # an independent operation: the composite case (an apply that is followed by a
+    # configure) is two runner Jobs driven by one Run, not one Job doing both.
+    if cfg.phase == "configure":
+        return _run_configure_phase(cfg, work_dir=work_dir)
+
     # 8. Build var-file / target / replace argv pieces.
     var_file_argv = tf_args.var_file_args(cfg.var_files)
     # The same var-files, resolved against the process directory, for a
@@ -912,6 +931,34 @@ def _run_body(cfg: RunnerConfig, work_dir: Path) -> int:
         )
     log.error("unknown phase", phase=cfg.phase)
     return 1
+
+
+def _run_configure_phase(cfg: RunnerConfig, *, work_dir: Path) -> int:
+    """Install the content the playbook needs, then run it (#1972).
+
+    Both steps go through the SAME execution environment, which is a correctness
+    requirement: `requires_ansible` is not enforced at install time, so
+    installing with one ansible-core and running with another produces a set
+    that fails mid-play, after the configure has begun changing hosts.
+
+    The install runs FIRST and its failure stops the configure -- a playbook
+    whose collections are missing fails per-task, part way through a fleet,
+    which is the worst time to discover it.
+
+    Failures to reach or drive the execution environment are deliberately NOT
+    caught: every caller above reads a returned integer as ansible's verdict, so
+    a configure that never ran must raise rather than return one. The same holds
+    for the inventory: `InventoryUnavailable` is a refusal, not an exit code.
+
+    The inventory is materialised BEFORE the collection install, which is the
+    cheaper order to fail in. The install reaches Galaxy and can take minutes;
+    an unreadable inventory is knowable in one request, and a configure that
+    cannot know its target set is not going to run whatever the install does.
+    """
+    cwd = (work_dir / cfg.config_directory).resolve() if cfg.config_directory else work_dir
+    inventory = configure_inventory.materialise(cfg)
+    ansible_collections.install(cfg, cwd, log_file=str(_CONFIGURE_LOG))
+    return configure.run(cfg, work_dir=work_dir, inventory=inventory, log_file=str(_CONFIGURE_LOG))
 
 
 def _run_pulumi_phase(cfg, *, child_grace: int) -> int:  # type: ignore[no-untyped-def]

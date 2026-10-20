@@ -66,6 +66,13 @@ _EE_TMPDIR = f"{_EE_SHARED_DIR}/tmp"
 _EE_COLLECTIONS_DIR = f"{_EE_SHARED_DIR}/collections"
 _EE_ROLES_DIR = f"{_EE_SHARED_DIR}/roles"
 _EE_HOME = f"{_EE_SHARED_DIR}/home"
+#: Where the orchestrator writes the run's resolved inventory for the EE to
+#: read (#1972). It MUST be on the shared volume: ansible runs in the EE, which
+#: mounts only this volume and the workspace, so an inventory written to the
+#: orchestrator's own `/tmp` is invisible to the process that has to read it.
+#: Here rather than on the workspace volume because the file is Terrapod's, not
+#: part of the operator's fetched tree.
+_EE_INVENTORY_DIR = f"{_EE_SHARED_DIR}/inventory"
 #: The group both containers reach the shared volumes through. The orchestrator
 #: runs 1000:1000; our own EE runs 1000:0; an operator's EE runs whatever its
 #: image says. `fsGroup` is what makes all three work: kubelet chowns every
@@ -370,6 +377,7 @@ def _add_execution_environment(
             {"name": "TP_EE_IMAGE", "value": ee_image},
             {"name": "TP_EE_COLLECTIONS_DIR", "value": _EE_COLLECTIONS_DIR},
             {"name": "TP_EE_ROLES_DIR", "value": _EE_ROLES_DIR},
+            {"name": "TP_EE_INVENTORY_DIR", "value": _EE_INVENTORY_DIR},
             {
                 "name": _EE_TOKEN_ENV,
                 "valueFrom": {
@@ -393,6 +401,7 @@ def _add_execution_environment(
                 "/bin/sh",
                 "-c",
                 f"mkdir -p {_EE_TMPDIR} {_EE_COLLECTIONS_DIR} {_EE_ROLES_DIR} {_EE_HOME} "
+                f"{_EE_INVENTORY_DIR} "
                 f"&& cp {_EE_AGENT_SRC} {_EE_AGENT_PATH}",
             ],
             "securityContext": {
@@ -441,7 +450,7 @@ def _add_execution_environment(
 
 def build_job_spec(
     run_id: str,
-    phase: str,  # "plan" or "apply"
+    phase: str,  # "plan", "apply" or "configure"
     runner_config: RunnerConfig,
     auth_secret_name: str,
     env_vars: list[dict[str, str]],
@@ -486,7 +495,7 @@ def build_job_spec(
         workspace_id: The run's own workspace, exported to the engine as
             TERRAPOD_WORKSPACE so the Terrapod provider defaults to it (#2036).
             Empty from a listener that predates it.
-        phase: "plan" or "apply".
+        phase: "plan", "apply" or "configure".
         runner_config: Global runner config (image, defaults, etc.).
         auth_secret_name: K8s Secret name containing the runner token.
         vars_secret_name: K8s Secret holding all workspace variable values
@@ -706,12 +715,13 @@ def build_job_spec(
             #           node drain). Plan never mutates Terrapod state or
             #           live AWS infra, so partial execution is safe to
             #           retry.
-            #   apply — never retry on disruption. Once the container ran,
-            #           terraform may have mutated state. K8s PodFailurePolicy
+            #   apply, configure — never retry on disruption. Once the
+            #           container ran, terraform may have mutated state and a
+            #           playbook may have changed a host. K8s PodFailurePolicy
             #           can't reliably distinguish "container started" from
             #           "container never ran" — kubelet behaviour differs
             #           across cluster versions/distributions for pre-start
-            #           disruption — so apply is conservatively never-retry.
+            #           disruption — so both are conservatively never-retry.
             #           Operator decides whether to re-run from the Run UI.
             #
             # Order matters: PodFailurePolicy evaluates rules in order, first

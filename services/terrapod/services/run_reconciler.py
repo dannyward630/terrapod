@@ -51,6 +51,30 @@ def _phase_of(status: str) -> str:
     return "apply"
 
 
+def _phase_start_of(run: Run) -> datetime | None:
+    """When the in-flight phase started, for the stale clock.
+
+    One producer because this was written three times, identically, as
+    `run.plan_started_at if run.status == "planning" else run.apply_started_at`
+    -- and every copy was wrong for a configure in the same way. A STANDALONE
+    configure has no apply, so `apply_started_at` is NULL and the `else` branch
+    gave the stale check nothing to measure against: the run could never time
+    out and would sit in `configuring` for ever. A COMPOSITE configure is worse
+    than that rather than better, because `apply_started_at` IS set, so the
+    clock would silently measure the configure's age from when its apply began
+    and time out a healthy configure early.
+
+    Returns None only for a status with no live phase, which the caller already
+    handles -- a run with no recorded start is treated as not yet stale rather
+    than as infinitely stale.
+    """
+    return {
+        "planning": run.plan_started_at,
+        "applying": run.apply_started_at,
+        "configuring": run.configure_started_at,
+    }.get(run.status, run.apply_started_at)
+
+
 async def _persist_live_log_if_missing(run: Run, phase: str) -> None:
     """Promote live-streamed log from Redis to object storage if the runner
     didn't upload its own final log.  This prevents log loss when a Job fails
@@ -203,13 +227,21 @@ async def reconcile_runs() -> None:
 
     This is the main entry point, called every 2s by the scheduler.
 
-    Picks up two cohorts:
-    1. planning/applying with job_name set — drive on Job status reports
-    2. planning/applying with NO job_name set — the listener claimed the run
-       but never reported job-launched (auth failure, K8s outage at create
-       time, listener died mid-launch). Without picking these up they sit
-       indefinitely. `_check_stale` applies a shorter `launch_timeout` to
-       this cohort so failures surface in minutes, not hours.
+    Picks up two cohorts, each over every in-flight status — planning,
+    applying, configuring and canceling. The status list is the whole of what
+    makes a run visible here: one missing from it is not reconciled slowly, it
+    is never reconciled at all, and sits in that status for ever with no stale
+    check and no Job-status round trip (#1972).
+
+    1. in-flight with job_name set — drive on Job status reports
+    2. in-flight with NO job_name set — the listener claimed the run but never
+       reported job-launched (auth failure, K8s outage at create time, listener
+       died mid-launch). Without picking these up they sit indefinitely.
+       `_check_stale` applies a shorter `launch_timeout` to this cohort so
+       failures surface in minutes, not hours. It reads the phase's own start
+       timestamp via `_phase_start_of`, so a status in the query whose clock is
+       unmapped reaches this cohort and then returns early — which is why the
+       two belong together and are gated together.
     """
     async with get_db_session() as db:
         # Refresh the per-pool queued-backlog gauge first — queued runs exist
@@ -231,7 +263,11 @@ async def reconcile_runs() -> None:
         result = await db.execute(
             select(Run, Workspace.engine)
             .join(Workspace, Workspace.id == Run.workspace_id)
-            .where(Run.status.in_(["planning", "applying", "canceling"]))
+            # `configuring` is here or nothing supervises a configure: the
+            # reconciler is what drives a run to terminal and times out a Job
+            # that never reports, so a configure absent from this set would sit
+            # live for ever however its Job ended (#1972).
+            .where(Run.status.in_(["planning", "applying", "configuring", "canceling"]))
         )
         runs = list(result.all())
 
@@ -547,7 +583,7 @@ async def _check_unschedulable(db: AsyncSession, run: Run) -> None:
     peer Job finishing), short enough that an operator on a fixed-resource
     cluster gets a fast, actionable signal rather than a 1h "stale" hang.
     """
-    phase_start = run.plan_started_at if run.status == "planning" else run.apply_started_at
+    phase_start = _phase_start_of(run)
     if phase_start is None:
         return
 
@@ -593,7 +629,7 @@ async def _check_init_stalled(db: AsyncSession, run: Run, *, terminal: bool) -> 
     """
     cfg = load_runner_config()
     if not terminal:
-        phase_start = run.plan_started_at if run.status == "planning" else run.apply_started_at
+        phase_start = _phase_start_of(run)
         if phase_start is None:
             return
         if datetime.now(UTC) - phase_start <= timedelta(seconds=cfg.ee_startup_timeout_seconds):
@@ -687,7 +723,7 @@ async def _check_stale(db: AsyncSession, run: Run) -> None:
       pods that never produced output. Looser default because a long
       `terraform plan` legitimately produces no extra status.
     """
-    phase_start = run.plan_started_at if run.status == "planning" else run.apply_started_at
+    phase_start = _phase_start_of(run)
     if phase_start is None:
         return
 

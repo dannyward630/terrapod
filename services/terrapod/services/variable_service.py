@@ -64,9 +64,60 @@ TFE_NATIVE_CATEGORY = "terraform"
 
 # The categories a variable may carry. `git_http_auth`/`git_ssh_auth` (#1028)
 # hold private-git-module credentials — always sensitive, materialized by the
-# runner's git_auth phase, never rendered into engine inputs.
-VALID_CATEGORIES = frozenset({NATIVE_CATEGORY, "env", "git_http_auth", "git_ssh_auth"})
+# runner's git_auth phase, never rendered into engine inputs. `ansible_*_auth`
+# (#1933) are the same mechanism for a configure: a machine credential and an
+# Ansible Vault password, materialized by the runner's ansible_auth phase.
+VALID_CATEGORIES = frozenset(
+    {
+        NATIVE_CATEGORY,
+        "env",
+        "git_http_auth",
+        "git_ssh_auth",
+        "ansible_machine_auth",
+        "ansible_vault_auth",
+    }
+)
 GIT_AUTH_CATEGORIES = frozenset({"git_http_auth", "git_ssh_auth"})
+
+#: The phases an apply-only variable (#2189) reaches. One producer, because the
+#: answer is a judgement about blast radius rather than a list of statuses, and
+#: it was already wrong once: `configure` arrived with #2194 and fell into "any
+#: other phase", so a configure silently dropped every apply-only row — its
+#: extra-vars as much as its credentials.
+#:
+#: A configure belongs on this side of the line for #1976's reason: it runs the
+#: repository's playbooks against real hosts, so it is a write with
+#: apply-equivalent blast radius, not a speculative read of a pull request's
+#: code. Withholding a credential from it withholds it from the ONLY phase that
+#: has anything to do with it.
+PHASES_SEEING_APPLY_ONLY = frozenset({"apply", "configure"})
+
+#: Ansible's two credential classes (#1933). `key` is the SCOPE in both, exactly
+#: as it is a URL pattern for git auth:
+#:
+#: * `ansible_machine_auth` — `key` is the credential's NAME. The INVENTORY
+#:   says where it is used, by a `${terrapod:<name>.<field>}` placeholder the
+#:   runner substitutes while rendering; the runner writes key material to a
+#:   mode-restricted file on the shared volume and substitutes its PATH, never
+#:   the key. Placement is the inventory's because that is already where an
+#:   operator says which host gets what.
+#: * `ansible_vault_auth` — `key` is the vault ID label. Several entries become
+#:   one `ANSIBLE_VAULT_IDENTITY_LIST`, which is how multiple vault IDs work.
+#:
+#: **The envelope's fields are NOT restated here.** `services/ansible_auth.py`
+#: is their one producer, shared with the runner so the two cannot disagree, and
+#: this comment had already drifted from it -- it listed five machine fields
+#: where `MACHINE_VALUE_FIELDS` carries six, omitting `become` and
+#: `become_user`. A field list in prose has no gate behind it.
+ANSIBLE_AUTH_CATEGORIES = frozenset({"ansible_machine_auth", "ansible_vault_auth"})
+
+#: Every category whose `value` is a JSON credential envelope rather than a
+#: literal the engine consumes. ONE producer, because three rules key on exactly
+#: this property and a second copy is a second thing to drift: such a value is
+#: always sensitive, it can never take a `vault` value source (a reference
+#: resolves to one field, an envelope is an object), and it is never rendered
+#: into an engine's inputs.
+CREDENTIAL_CATEGORIES = GIT_AUTH_CATEGORIES | ANSIBLE_AUTH_CATEGORIES
 
 #: Names accepted on input that are not the canonical one. `pulumi_config`
 #: existed only briefly (#1565) and is folded in rather than rejected, so a
@@ -148,8 +199,8 @@ async def create_variable(
     """Create a workspace variable."""
     category = _validated_category(category)
     key = _validated_env_key(key, category)
-    if category in GIT_AUTH_CATEGORIES:
-        sensitive = True  # git-auth values are always secret
+    if category in CREDENTIAL_CATEGORIES:
+        sensitive = True  # a credential envelope is always secret
     if value_source == "vault":
         sensitive = True  # what the reference resolves to is always a secret
     var = Variable(
@@ -202,10 +253,10 @@ async def update_variable(
         var.value = value
         var.version_id = _version_hash(var.key, value, var.category)
 
-    # git-auth categories are always secret and can never be downgraded, and
+    # A credential category is always secret and can never be downgraded, and
     # neither can a vault reference — what it resolves to is a secret however the
     # request describes it.
-    force_sensitive = var.category in GIT_AUTH_CATEGORIES or var.value_source == "vault"
+    force_sensitive = var.category in CREDENTIAL_CATEGORIES or var.value_source == "vault"
     if force_sensitive:
         var.sensitive = True
     elif sensitive is not None:
@@ -273,6 +324,8 @@ async def resolve_variables(
 
     * ``"apply"`` — every variable, with an **apply-only** row shadowing a
       standard row of the same `(category, key)` *within its own tier*.
+    * ``"configure"`` — treated like an apply, because a configure runs
+      playbooks against real hosts (`PHASES_SEEING_APPLY_ONLY`).
     * ``"plan"`` (or any other phase) — apply-only rows are excluded entirely.
     * ``None`` — every row, **including both halves of a standard/apply-only
       pair**, because the key carries `apply_only` too. Not "no filter":
@@ -304,7 +357,7 @@ async def resolve_variables(
     # from an environment variable of the same name, apply_only separates the
     # plan's copy from the apply's.
     resolved: dict[object, ResolvedVariable] = {}
-    include_apply_only = phase is None or phase == "apply"
+    include_apply_only = phase is None or phase in PHASES_SEEING_APPLY_ONLY
 
     def _key(category: str, k: str, apply_only: bool) -> object:
         return (category, k) if phase is not None else (category, k, apply_only)

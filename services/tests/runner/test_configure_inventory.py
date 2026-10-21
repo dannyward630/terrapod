@@ -28,6 +28,7 @@ from terrapod.runner.phases.configure_inventory import (
     document_to_source,
     materialise,
 )
+from terrapod.services.ansible_auth import placeholder_for
 
 #: Every shape that carries a distinct risk: a host with variables, a var-less
 #: host, a host in no group, direct membership, a declared empty group, and a
@@ -112,6 +113,124 @@ class TestTheRenderedSource:
         failure -- so the render must not produce something unparseable."""
         parsed = yaml.safe_load(document_to_source({"hosts": {}, "groups": {}, "children": {}}))
         assert parsed == {"all": None}
+
+
+class TestCredentialSubstitution:
+    """#1933. The inventory names a credential; this render substitutes it.
+
+    What ansible DOES with the result is pinned in
+    `tests/runner/test_phase_ansible_auth.py`, which drives the real binary.
+    These pin the renderer's own contract: that substitution happens here, that
+    it reaches every depth, and that an unresolvable reference refuses.
+    """
+
+    DOCUMENT = {
+        "hosts": {"w1": {"ansible_port": 22}},
+        "groups": {"web": ["w1"], "db": []},
+        "children": {"infra": ["web"]},
+    }
+
+    def _render(self, document=None, resolved=None):
+        return json.loads(
+            configure_inventory.document_to_source(
+                document if document is not None else self.DOCUMENT, resolved=resolved
+            )
+        )
+
+    def test_no_references_renders_exactly_what_it_rendered_before(self):
+        """The parameter is optional and a document with no placeholder must be
+        byte-identical either way, or this feature changes what a configure with
+        no credentials targets."""
+        before = configure_inventory.document_to_source(self.DOCUMENT)
+        assert configure_inventory.document_to_source(self.DOCUMENT, resolved={}) == before
+        assert configure_inventory.document_to_source(self.DOCUMENT, resolved=None) == before
+
+    def test_a_host_variable_reference_is_substituted(self):
+        document = {
+            "hosts": {
+                "w1": {"ansible_ssh_private_key_file": placeholder_for("web", "private_key")}
+            },
+            "groups": {},
+            "children": {},
+        }
+        out = self._render(document, {"web.private_key": "/tp/credentials/k"})
+        assert out["all"]["hosts"]["w1"]["ansible_ssh_private_key_file"] == "/tp/credentials/k"
+
+    def test_a_reference_inside_a_longer_string_is_substituted(self):
+        """The shape a per-group key actually takes in a real estate."""
+        document = {
+            "hosts": {
+                "w1": {
+                    "ansible_ssh_common_args": f"-o IdentityFile={placeholder_for('web', 'private_key')}"
+                }
+            },
+            "groups": {},
+            "children": {},
+        }
+        out = self._render(document, {"web.private_key": "/tp/credentials/k"})
+        assert out["all"]["hosts"]["w1"]["ansible_ssh_common_args"] == (
+            "-o IdentityFile=/tp/credentials/k"
+        )
+
+    def test_an_unresolvable_reference_REFUSES_naming_it(self):
+        """Neither left in place nor blanked. Left, ansible hands ssh the
+        literal as a key path; blanked, it connects with no key -- and both
+        arrive as an unreachable host, naming neither the credential nor the
+        typo."""
+        document = {
+            "hosts": {
+                "w1": {"ansible_ssh_private_key_file": placeholder_for("typo", "private_key")}
+            },
+            "groups": {},
+            "children": {},
+        }
+        with pytest.raises(configure_inventory.InventoryUnavailable) as exc:
+            self._render(document, {"web.private_key": "/tp/credentials/k"})
+        assert "${terrapod:typo.private_key}" in str(exc.value)
+
+    def test_every_unresolvable_reference_is_named_not_just_the_first(self):
+        """Fixing one and re-running to find the next is the experience this
+        avoids."""
+        document = {
+            "hosts": {
+                "w1": {"a": placeholder_for("one", "private_key")},
+                "w2": {"b": placeholder_for("two", "password")},
+            },
+            "groups": {},
+            "children": {},
+        }
+        with pytest.raises(configure_inventory.InventoryUnavailable) as exc:
+            self._render(document, {})
+        assert "one.private_key" in str(exc.value) and "two.password" in str(exc.value)
+
+    def test_a_field_typo_is_refused_rather_than_ignored(self):
+        """The grammar does not know the field set, so a wrong FIELD is an
+        unresolved reference rather than ordinary text that passes through."""
+        document = {
+            "hosts": {"w1": {"k": "${terrapod:web.privatekey}"}},
+            "groups": {},
+            "children": {},
+        }
+        with pytest.raises(configure_inventory.InventoryUnavailable):
+            self._render(document, {"web.private_key": "/tp/credentials/k"})
+
+    def test_a_string_that_merely_mentions_terrapod_is_left_alone(self):
+        """The negative path: the pattern must not be so loose that ordinary
+        prose in a variable becomes a failed reference."""
+        document = {
+            "hosts": {"w1": {"note": "managed by terrapod, see ${HOME}/notes"}},
+            "groups": {},
+            "children": {},
+        }
+        out = self._render(document, {})
+        assert out["all"]["hosts"]["w1"]["note"] == "managed by terrapod, see ${HOME}/notes"
+
+    def test_substituting_does_not_disturb_the_hosts_or_the_nesting(self):
+        """The nesting is what `--limit` expands through, so a renderer that
+        rearranged it would change what a limit selects."""
+        plain = json.loads(configure_inventory.document_to_source(self.DOCUMENT))
+        out = self._render(self.DOCUMENT, {"web.private_key": "/x"})
+        assert out == plain
 
 
 class TestItFailsClosed:
@@ -301,6 +420,41 @@ class TestTheRoundTripThroughRealAnsible:
         out = self._list(document_to_source(DOCUMENT))
         assert out["_meta"]["hostvars"]["web1"]["ansible_host"] == "10.0.0.11"
         assert out["_meta"]["hostvars"]["web1"]["role"] == "web"
+
+    def test_the_file_MATERIALISE_WRITES_substitutes_the_references(self, cfg, monkeypatch):
+        """Through `materialise`, for the same reason as the test below it.
+
+        Measured: dropping `resolved=` from the one `write_text` -- so the
+        parameter is accepted and ignored, which is the shape of every
+        flag-nothing-reads in this repo -- leaves every other test in this file
+        green, because they drive `document_to_source` directly. This is the
+        test that fails, and it asserts through REAL ansible so the claim is
+        "the credential reaches the host" rather than "a key is in a dict".
+        """
+        host = next(iter(DOCUMENT["hosts"]))
+        document = {
+            **DOCUMENT,
+            "hosts": {
+                **DOCUMENT["hosts"],
+                host: {
+                    **(DOCUMENT["hosts"][host] or {}),
+                    "ansible_ssh_private_key_file": placeholder_for("web-key", "private_key"),
+                },
+            },
+        }
+
+        def fake(url, dest, **kwargs):
+            Path(dest).write_text(json.dumps(document))
+            return type("R", (), {"ok": True, "status": 200})()
+
+        monkeypatch.setattr(configure_inventory, "download_to_file", fake)
+        written = materialise(cfg, resolved={"web-key.private_key": "/tp/credentials/WEB"})
+
+        # No placeholder survives into the file ansible reads...
+        assert "${terrapod:" not in written.read_text()
+        # ...and ansible resolves the substituted value for that host.
+        hostvars = (self._list(written.read_text()).get("_meta") or {}).get("hostvars") or {}
+        assert hostvars[host]["ansible_ssh_private_key_file"] == "/tp/credentials/WEB"
 
     def test_the_file_MATERIALISE_WRITES_resolves_to_the_right_hosts(self, cfg, monkeypatch):
         """Through `materialise`, not through the renderer.

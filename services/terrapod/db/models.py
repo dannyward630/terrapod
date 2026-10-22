@@ -488,6 +488,21 @@ class Workspace(Base):
     auto_configure_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false", default=False
     )
+
+    #: Force a derived configure to target EVERY host rather than just the ones
+    #: an inventory change affected (#2229).
+    #:
+    #: Narrowing is the default, and it is conditioned on the thing that actually
+    #: justifies breadth: new playbook or role code must reach every host, while
+    #: a changed HOST is no reason to touch the others. So a derived configure
+    #: narrows when the ansible code under `config_directory` is unchanged since
+    #: the last successful configure, and goes wide when it moved.
+    #:
+    #: This flag is the override, and it widens. That direction is deliberate --
+    #: a flag someone forgets leaves them configuring more, not less.
+    configure_all_hosts: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False
+    )
     configure_after_apply: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false", default=False
     )
@@ -1921,6 +1936,21 @@ class AutodiscoveryRule(Base):
     auto_configure_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false", default=False
     )
+
+    #: Force a derived configure to target EVERY host rather than just the ones
+    #: an inventory change affected (#2229).
+    #:
+    #: Narrowing is the default, and it is conditioned on the thing that actually
+    #: justifies breadth: new playbook or role code must reach every host, while
+    #: a changed HOST is no reason to touch the others. So a derived configure
+    #: narrows when the ansible code under `config_directory` is unchanged since
+    #: the last successful configure, and goes wide when it moved.
+    #:
+    #: This flag is the override, and it widens. That direction is deliberate --
+    #: a flag someone forgets leaves them configuring more, not less.
+    configure_all_hosts: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False
+    )
     configure_after_apply: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false", default=False
     )
@@ -2968,9 +2998,17 @@ class Run(Base):
     #: plan. Empty means the workspace's `default_limit`, which may itself be
     #: empty, meaning the whole resolved inventory.
     #:
-    #: A git-driven or otherwise platform-decided configure leaves both of
-    #: these empty: a push carries no run options, so it runs the workspace's
-    #: declared defaults, and that is what bounds its blast radius (#1974).
+    #: A git-driven or otherwise platform-decided configure leaves `playbook`
+    #: empty: a push carries no run options, so it runs the workspace's declared
+    #: default, and that is what bounds its blast radius (#1974).
+    #:
+    #: It may, however, carry a COMPUTED `ansible_limit` (#2229). A configure the
+    #: platform derived -- from an inventory change, or chained onto an apply --
+    #: is narrowed to the hosts whose resolved configuration actually moved,
+    #: intersected with the workspace's own `default_limit`, so the stored value
+    #: is never wider than the default it replaces. Empty still means "the
+    #: workspace's default", which is what a wide derived run and every
+    #: operator-queued run without a limit both record.
     ansible_limit: Mapped[str] = mapped_column(
         String(500), nullable=False, server_default="", default=""
     )

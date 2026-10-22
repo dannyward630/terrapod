@@ -2548,7 +2548,7 @@
       "ansibleVersionPlaceholder": "例: 2.21.5",
       "ansibleVersionTitle": "このワークスペースの ansible-core バージョン。空欄にするとデプロイメントのデフォルトに従います。",
       "ansibleCollections": "Ansible コレクション",
-      "ansibleCollectionsHint": "configure の実行前にインストールされるコレクションです。1 行に 1 つ、namespace.name または namespace.name:version の形式で指定します。構成自体の requirements ファイルより後にインストールされて上書きするため、ここで指定したバージョンがリポジトリにコミットされたものより優先されます。",
+      "ansibleCollectionsHint": "構成の実行前にインストールされるコレクションです。1 行に 1 つ、namespace.name または namespace.name:version の形式で指定します。構成自体の requirements ファイルより後にインストールされて上書きするため、ここで指定したバージョンがリポジトリにコミットされたものより優先されます。",
       "ansibleCollectionsPlaceholder": "例: community.general:9.2.0",
       "ansibleCollectionsAdd": "コレクションを追加",
       "operations": "操作",
@@ -2638,7 +2638,9 @@
       "autoConfigureEnabledHint": "Ansible 設定ディレクトリを変更するプッシュがプレイブックを実行します。既定の limit が設定されていない場合、対象はインベントリ全体です。",
       "autoConfigureEnabledHintLimited": "Ansible 設定ディレクトリを変更するプッシュが、{limit} に対してプレイブックを実行します。",
       "configureAfterApply": "適用後に構成",
-      "configureAfterApplyHint": "ここでの適用はすべて、同じ実行内で構成に続きます。そのため CLI からの適用でもプレイブックの出力がストリーミングされます。破棄では構成は行われません。"
+      "configureAfterApplyHint": "ここでの適用はすべて、同じ実行内で構成に続きます。そのため CLI からの適用でもプレイブックの出力がストリーミングされます。破棄では構成は行われません。",
+      "configureAllHosts": "すべてのホストを構成",
+      "configureAllHostsHint": "プラットフォームが自動的に開始する構成は、インベントリの変更が及んだホストのみを対象とします。ただし、前回の構成以降に Ansible のコードが変更されている場合は絞り込みません。これをオンにすると、常にインベントリ全体を対象とします。"
     },
     "vcsWorkflowWarning": {
       "title": "認可はVCSリポジトリに委譲されます。",

@@ -119,15 +119,45 @@ test.describe('Run log pane height', () => {
     await page.goto(`/workspaces/${wsId}/runs/${runId}?view=plan`);
     await expect(page.getByTestId('log-pre-plan')).toBeVisible({ timeout: 20_000 });
 
+    /** The height the layout effect has published for the CURRENT viewport.
+     *  It is an INLINE style on the reserve div -- `reserveEl.style
+     *  .setProperty('--log-avail', ...)` -- not a property on the document
+     *  root, and not on `log-pane-plan`, which is the outer card and carries a
+     *  toolbar above this box. Reading it off the wrong element returns the
+     *  empty string, and `parseFloat('')` is NaN, which fails every comparison
+     *  without ever saying why. */
+    async function availPx(): Promise<number> {
+      return page
+        .getByTestId('log-reserve-plan')
+        .evaluate((el) => parseFloat((el as HTMLElement).style.getPropertyValue('--log-avail')));
+    }
+
     /** Space between the bottom of the pane and the bottom of the window, at
      *  rest. boundingBox() is viewport-relative, so scroll to the top first. */
     async function gapAt(height: number): Promise<number> {
+      const before = await availPx();
       await page.setViewportSize({ width: 1280, height });
       await page.evaluate(() => window.scrollTo(0, 0));
       let gap = NaN;
-      // The height is applied by a layout effect and a ResizeObserver, so let
-      // it settle rather than racing the first frame after the resize.
+      // Settle on the MECHANISM, not on the symptom. `gap >= 0` alone is NOT a
+      // settle condition and this flaked on it: it is satisfied the instant the
+      // pane is anywhere above the fold, including before the ResizeObserver
+      // has applied the new height -- so the first poll returned a gap measured
+      // against the PREVIOUS viewport and the equality below failed by the
+      // difference between the two (426px once).
+      //
+      // `logPaneHeightPx` derives the published height from
+      // `window.innerHeight`, and the two viewports this test uses are 300px
+      // apart with both results well above `LOG_PANE_MIN_PX` (400), so the
+      // value MUST change across a resize. Its having changed is therefore
+      // proof the effect has run for THIS viewport -- which is the property
+      // worth waiting on, and it needs no assumption about which box equals
+      // which. A first call whose `before` is NaN because the effect had not
+      // run yet settles on the first real number, which is also correct.
       await expect(async () => {
+        const avail = await availPx();
+        expect(avail).toBeGreaterThan(0);
+        expect(avail).not.toBe(before);
         const box = (await page.getByTestId('log-pane-plan').boundingBox())!;
         gap = height - (box.y + box.height);
         expect(gap).toBeGreaterThanOrEqual(0);

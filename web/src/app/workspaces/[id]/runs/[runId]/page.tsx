@@ -23,6 +23,8 @@ import { useIsTouch } from '@/lib/use-media-query'
 import { createLogFollower, type LogFollower } from '@/lib/log-follower'
 import { logPaneHeightPx } from '@/lib/log-pane-height'
 import { parsePlanLogIndex, type PlanEntryAction } from '@/lib/plan-log-index'
+import { filterHostLog, parseHostLog, pickerHostList, stripHostTags } from '@/lib/host-log'
+import { hostStatusKey } from '@/lib/host-status'
 import { ArrowDownToLine, RefreshCw, Download, Copy, Check, Palette } from 'lucide-react'
 
 import {
@@ -75,6 +77,11 @@ interface RunAttrs {
   'auto-apply-mode': string
   'auto-apply-declined-reason': string | null
   'plan-only': boolean
+  // The Ansible half (#1974). `is-configure` means the run carries a
+  // configure; with `configure-after-apply` it is a composite that applies
+  // first, and without it a standalone configure. Either way its output is
+  // its own log artifact, which is what the Configure pane reads (#2144).
+  'is-configure'?: boolean
   // `tofu plan -out=FILE` (#1903) -- apply-capable, apply deferred.
   'save-plan': boolean
   'is-destroy': boolean
@@ -149,6 +156,7 @@ type RunView =
   | 'impact'
   | 'cost'
   | 'hosts'
+  | 'configure'
   | 'plan'
   | 'apply'
   | 'details'
@@ -157,6 +165,22 @@ type RunView =
 // `_POST_PLAN_STATES` for the plan log endpoint. The plan log is then only
 // waiting for its stored copy (#1591).
 const PLAN_PHASE_DONE = ['planned', 'confirmed', 'applying', 'applied', 'errored', 'discarded', 'canceled']
+
+/**
+ * The three log phases a run can have.
+ *
+ * Named here rather than written out at each use because there was no shared
+ * type: the union `'plan' | 'apply'` was spelled three times in this file and
+ * nowhere else, so adding a third phase meant finding all three by hand.
+ */
+export type LogPhase = 'plan' | 'apply' | 'configure'
+
+// Statuses in which a configure's log is worth reading. `configuring` is the
+// live one; the terminal states are when its stored copy is still arriving.
+// `confirmed` and `applying` are excluded deliberately -- on a composite the
+// configure has not started yet, and an empty pane that says nothing is worse
+// than a pane that is not there.
+const CONFIGURE_VISIBLE = ['configuring', 'canceling', 'applied', 'errored', 'canceled', 'discarded']
 
 // How far below the pane's top edge a jumped-to line lands, in pixels — about
 // two lines of the log's monospace type. Deliberately a fixed gap rather than a
@@ -466,7 +490,7 @@ function LogPanel({
   precomputedHtml?: string
   loading: boolean
   emptyMessage: string
-  phase: 'plan' | 'apply'
+  phase: LogPhase
   runId: string
   isStreaming: boolean
   /** The run's engine, so the plan index names the summary block its way (#1911). */
@@ -489,6 +513,9 @@ function LogPanel({
   // touch tablet/foldable page-scrolls too, while a mouse (any width) keeps the
   // inner pane. Mirrors the CSS `fine:` overflow on the <pre> below.
   const t = useTranslations('runDetail')
+  // The per-host status strings are the Hosts tab's (#1928), reused rather
+  // than restated, so the picker and the table cannot disagree about a word.
+  const tHosts = useTranslations('runDetail.hosts')
   const tRoot = useTranslations()
   const summaryLabel = engineWord(tRoot, engine, 'logIndexSummary')
   const isTouch = useIsTouch()
@@ -519,17 +546,89 @@ function LogPanel({
 
   const cleanLog = useMemo(() => (log ? stripStxEtx(log) : null), [log])
 
+  // The per-host switch (#2144). Parsed from the log's own content, so the
+  // control appears only when the runner actually tagged it: an older runner
+  // image emits ansible's plain output, and the fallback is the traditional
+  // view with the switch absent rather than an empty per-host pane.
+  const hostLog = useMemo(() => parseHostLog(cleanLog), [cleanLog])
+  const [hostFilter, setHostFilter] = useState('')
+
+  // Every host the run TARGETED, not only those that have produced output
+  // yet. An inventory host ansible has not reached is exactly what someone
+  // goes looking for, and the log alone cannot name it -- a host with no
+  // output has no tagged line to be found in. `/host-results` is complete
+  // from run creation: it unions the recap rows with the run's own resolved
+  // inventory, so mid-run it already returns every targeted host.
+  //
+  // Refetched on the streaming edge rather than per log chunk, because the
+  // two halves settle at different times: the host LIST is complete from
+  // creation, while a status comes from the PLAY RECAP and so is not known
+  // for any host until the phase ends. Polling per chunk would be a request
+  // per chunk to learn nothing.
+  const [hostRows, setHostRows] = useState<{ host: string; status: string }[]>([])
+  useEffect(() => {
+    if (!hostLog.tagged) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await apiFetch(`/api/v1/runs/${runId}/host-results`)
+        if (!res.ok || cancelled) return
+        const d = await res.json()
+        if (cancelled) return
+        setHostRows(
+          (d.data || [])
+            .map((r: { attributes?: { host?: string; status?: string } }) => ({
+              host: r.attributes?.host ?? '',
+              status: r.attributes?.status ?? '',
+            }))
+            .filter((r: { host: string }) => r.host),
+        )
+      } catch {
+        /* The picker degrades to the hosts the log names, never to nothing:
+           an unreachable read must not remove a control that works. */
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [runId, hostLog.tagged, isStreaming])
+
+  // The union lives in `host-log.ts` so it has a gate of its own: the only
+  // coverage for it here would be an E2E spec, and the property -- that a
+  // targeted host which produced nothing is still offered -- is pure logic.
+  const pickerHosts = useMemo(
+    () => pickerHostList(hostLog.hosts, hostRows),
+    [hostLog.hosts, hostRows],
+  )
+
+  // The text actually shown. For a tagged log this is never `cleanLog`: even
+  // the combined view has to have the tags removed, because the traditional
+  // view's whole promise is ansible's own words and nothing else.
+  const shownLog = useMemo(() => {
+    if (!hostLog.tagged) return cleanLog
+    return hostFilter ? filterHostLog(hostLog, hostFilter) : stripHostTags(cleanLog)
+  }, [hostLog, hostFilter, cleanLog])
+
   const htmlContent = useMemo(() => {
+    // The page's precomputed HTML is an incremental conversion of the RAW log,
+    // so it still carries the host prefixes and cannot serve a tagged one --
+    // and converting per render is what the filter costs. A fresh Convert, for
+    // the reason the indexed path gives: the shared instance carries SGR state
+    // between calls and would drift colour.
+    if (hostLog.tagged) {
+      if (!shownLog || !colorMode) return ''
+      return new Convert({ fg: '#cbd5e1', bg: 'transparent', escapeXML: true }).toHtml(shownLog)
+    }
     if (precomputedHtml !== undefined) return precomputedHtml
     if (!cleanLog) return ''
     if (!colorMode) return ''
     return ansiConverter.toHtml(cleanLog)
-  }, [cleanLog, colorMode, precomputedHtml])
+  }, [cleanLog, colorMode, precomputedHtml, hostLog.tagged, shownLog])
 
   const plainContent = useMemo(() => {
-    if (!cleanLog) return ''
-    return stripAnsi(cleanLog)
-  }, [cleanLog])
+    if (!shownLog) return ''
+    return stripAnsi(shownLog)
+  }, [shownLog])
 
   // The plan index (#1590), built only from a log the server has marked
   // complete. A still-arriving log would shift its own entries under the
@@ -624,9 +723,16 @@ function LogPanel({
   // Pin the active scroller to the tail when following and the content changes.
   // Runs in useLayoutEffect (synchronously before paint) so a fresh chunk or
   // the panel's own resize never flashes an intermediate scroll position.
+  //
+  // Keyed on `shownLog`, the text actually rendered, rather than on the `log`
+  // prop: switching the per-host filter changes the content without any new
+  // chunk arriving, and #2144 requires the switch to preserve follow. Keyed on
+  // `log` it did not -- a filtered view opened short of its own tail and stayed
+  // there until the next chunk happened to land, which on a finished run is
+  // never.
   useLayoutEffect(() => {
     if (following) scrollToBottom(false)
-  }, [log, colorMode, following, scrollToBottom])
+  }, [shownLog, colorMode, following, scrollToBottom])
 
   // Track the scroller's position so scrolling up to read disengages follow and
   // scrolling back to the bottom re-engages it. The listener is on the window
@@ -861,6 +967,43 @@ function LogPanel({
                 </select>
               </>
             )}
+            {/* The per-host filter (#2144). A FILTER, not a jump like the plan
+                index beside it: the ask was to "see only output for a specific
+                host", so the selection is state and persists across the
+                mid-run updates rather than resetting to a placeholder.
+
+                Data-gated on the log carrying tags, so a Terraform or Pulumi
+                run never sees it and neither does a configure from a runner
+                that predates the callback. */}
+            {hostLog.tagged && (
+              <>
+                <label htmlFor={`log-hosts-${phase}`} className="sr-only">
+                  {t('log.hosts.label')}
+                </label>
+                <select
+                  id={`log-hosts-${phase}`}
+                  data-testid={`log-hosts-${phase}`}
+                  value={hostFilter}
+                  onChange={e => setHostFilter(e.target.value)}
+                  className="px-2 py-1 text-xs rounded font-medium bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors max-w-[12rem] focus:border-brand-500 focus:outline-none"
+                  title={t('log.hosts.title')}
+                >
+                  <option value="">{t('log.hosts.all')}</option>
+                  {pickerHosts.map(({ host, status }) => {
+                    // `hostStatusKey` returns null for a status the server
+                    // has added and the UI does not know, so the option falls
+                    // back to the bare name rather than rendering a raw
+                    // lower-case slug among translated ones (#1334).
+                    const key = status ? hostStatusKey(status) : null
+                    return (
+                      <option key={host} value={host}>
+                        {key ? `${host} \u2014 ${tHosts(key)}` : host}
+                      </option>
+                    )
+                  })}
+                </select>
+              </>
+            )}
             {/* "End" jumps to the tail (one-shot). Distinct from Follow: End is a
                 single scroll-to-bottom, always available; Follow is the streaming
                 auto-tail mode. Phones have a built-in scroll-to-top, so no Top. */}
@@ -1012,6 +1155,12 @@ function RunDetailPageInner() {
   const [planLogComplete, setPlanLogComplete] = useState(false)
   const [planLogLoading, setPlanLogLoading] = useState(false)
   const [applyLogLoading, setApplyLogLoading] = useState(false)
+  // The configure phase (#2144). A third pane rather than output folded into
+  // the apply's: a composite run executes a SEPARATE configure Job whose log is
+  // its own artifact, so there is nothing to fold.
+  const [configureLog, setConfigureLog] = useState<string | null>(null)
+  const [configureHtml, setConfigureHtml] = useState('')
+  const [configureLogLoading, setConfigureLogLoading] = useState(false)
   // Bumped when the SSE `plan_summary_ready` event arrives so the
   // PlanAiSummary component refetches without forcing the whole run to
   // reload.
@@ -1042,11 +1191,22 @@ function RunDetailPageInner() {
   // Cached log-read-url to avoid re-fetching plan/apply object each cycle
   const planLogUrl = useRef<string | null>(null)
   const applyLogUrl = useRef<string | null>(null)
+  const configureLogUrl = useRef<string | null>(null)
+  // Phase -> its cached capability URL. A table rather than a ternary chain:
+  // the two readers below both had one, and a third phase meant editing both
+  // in step. The URL is cached because it carries a signed capability the log
+  // body is then fetched with, credential-less.
+  const LOG_URL_REFS: Record<LogPhase, React.MutableRefObject<string | null>> = {
+    plan: planLogUrl,
+    apply: applyLogUrl,
+    configure: configureLogUrl,
+  }
   // One follower per phase (#1591): owns the offset, the fetch serialisation,
   // the live poll while the phase streams, and following a finished phase's
   // log until the server marks it complete. See web/src/lib/log-follower.ts.
   const planFollower = useRef<LogFollower | null>(null)
   const applyFollower = useRef<LogFollower | null>(null)
+  const configureFollower = useRef<LogFollower | null>(null)
 
   const searchParams = useSearchParams()
   const tabParam = searchParams.get('tab')
@@ -1069,6 +1229,7 @@ function RunDetailPageInner() {
     'impact',
     'cost',
     'hosts',
+    'configure',
     'plan',
     'apply',
     'details',
@@ -1237,6 +1398,7 @@ function RunDetailPageInner() {
     if (event.event === 'log_updated' && event.run_id === bareId) {
       if (event.phase === 'plan') loadPlanLog()
       else if (event.phase === 'apply') loadApplyLog()
+      else if (event.phase === 'configure') loadConfigureLog()
     }
     // Any of the summary-lifecycle events should trigger a refetch
     // (pending, ready, errored, skipped, message_posted). The
@@ -1301,6 +1463,18 @@ function RunDetailPageInner() {
     } else {
       getApplyFollower().setPhase('idle')
     }
+    // `configuring` appears in NEITHER list above, so before this both
+    // followers went idle for a configuring run and its log was unreachable
+    // for that reason as well as for having no route (#2144).
+    if (run.attributes['is-configure'] && CONFIGURE_VISIBLE.includes(status)) {
+      getConfigureFollower().setPhase(
+        status === 'configuring' ? 'streaming' : status === 'canceling' ? 'idle' : 'finished',
+      )
+      setConfigureLogLoading(prev => configureLog === null ? true : prev)
+      loadConfigureLog(true).finally(() => setConfigureLogLoading(false))
+    } else {
+      getConfigureFollower().setPhase('idle')
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberately keyed on the run's id + status — depending on the log state or the loaders would loop, since this effect is what sets them
   }, [run?.id, run?.attributes.status, run?.attributes['blocked-by']])
 
@@ -1308,13 +1482,15 @@ function RunDetailPageInner() {
   useEffect(() => () => {
     planFollower.current?.dispose()
     applyFollower.current?.dispose()
+    configureFollower.current?.dispose()
   }, [])
 
-  async function fetchLogUrl(phase: 'plan' | 'apply'): Promise<string | null> {
-    const urlRef = phase === 'plan' ? planLogUrl : applyLogUrl
+  async function fetchLogUrl(phase: LogPhase): Promise<string | null> {
+    const urlRef = LOG_URL_REFS[phase]
     if (urlRef.current) return urlRef.current
-    const endpoint = phase === 'plan' ? 'plan' : 'apply'
-    const res = await apiFetch(`/api/terrapod/v1/runs/${runId}/${endpoint}`)
+    // The sub-resource is named for the phase on every one of the three, so
+    // the phase IS the endpoint rather than something mapped to it.
+    const res = await apiFetch(`/api/terrapod/v1/runs/${runId}/${phase}`)
     if (!res.ok) return null
     const data = await res.json()
     const obj = data.data as PlanApply
@@ -1324,8 +1500,8 @@ function RunDetailPageInner() {
   }
 
   /** Read one phase's log from `offset`; null when it is not available yet. */
-  async function readLog(phase: 'plan' | 'apply', offset: number, fresh: boolean): Promise<Uint8Array | null> {
-    const urlRef = phase === 'plan' ? planLogUrl : applyLogUrl
+  async function readLog(phase: LogPhase, offset: number, fresh: boolean): Promise<Uint8Array | null> {
+    const urlRef = LOG_URL_REFS[phase]
     if (fresh) urlRef.current = null
     const url = await fetchLogUrl(phase)
     if (!url) return null
@@ -1375,6 +1551,32 @@ function RunDetailPageInner() {
       })
     }
     return applyFollower.current
+  }
+
+  function getConfigureFollower(): LogFollower {
+    if (!configureFollower.current) {
+      configureFollower.current = createLogFollower({
+        read: (offset, fresh) => readLog('configure', offset, fresh),
+        onText: (chunk, mode) => {
+          // The raw text is kept as well as the HTML, because the per-host
+          // filter works on the text: the tag is in the bytes, and parsing
+          // highlighted HTML to find it would be parsing our own output twice.
+          const html = ansiConverter.toHtml(chunk)
+          if (mode === 'replace') {
+            setConfigureLog(chunk || null)
+            setConfigureHtml(html)
+          } else {
+            setConfigureLog(prev => (prev ?? '') + chunk)
+            setConfigureHtml(prev => prev + html)
+          }
+        },
+      })
+    }
+    return configureFollower.current
+  }
+
+  function loadConfigureLog(reset = false): Promise<void> {
+    return getConfigureFollower().fetch(reset)
   }
 
   function loadPlanLog(reset = false): Promise<void> {
@@ -1496,6 +1698,14 @@ function RunDetailPageInner() {
   const applyLabel = tPhase.rich(phaseKey(engine, 'words', 'tabApplyLabel'), {
     log: (chunks) => <span className="hidden md:inline"> {chunks}</span>,
   })
+  // The same treatment, from `runDetail` rather than the phase vocabulary:
+  // "Configure" does not vary by engine, because a configure is a phase and
+  // not an engine with phases of its own. `phases.*` has entries for terraform
+  // and pulumi only, so a vocabulary lookup here would fall back to
+  // Terraform's words and label this pane "Apply log".
+  const configureLabel = t.rich('tabs.configureLabel', {
+    log: (chunks) => <span className="hidden md:inline"> {chunks}</span>,
+  })
   // Each tab carries a rich label (for the desktop bar) AND a plain-text label
   // (for the mobile <select>, whose <option>s can't hold JSX).
   // Tab order (#1036 review): Overview → Plan → Cost → Security → OPA → Impact
@@ -1534,6 +1744,18 @@ function RunDetailPageInner() {
       : []) as [RunView, React.ReactNode, string][]),
     ['details', t('tabs.details'), t('tabs.details')],
     ...((attrs['plan-only'] ? [] : [['apply', applyLabel, word('tabApplyFull')]]) as [RunView, React.ReactNode, string][]),
+    // The configure log (#2144). Data-gated on the run carrying a configure,
+    // not on a flag: a terraform or pulumi run has no configure phase, so the
+    // tab is simply not there -- the same rule as the Hosts tab above.
+    //
+    // It is LAST because that is the order the phases run in: a composite
+    // applies and then configures, so the pane sits after the apply's.
+    // "Configure" is phase-neutral vocabulary rather than an engine's word --
+    // a configure is a phase, not an engine with phases of its own -- so it
+    // comes from `runDetail.tabs` and not from the phase vocabulary.
+    ...((attrs['is-configure']
+      ? [['configure', configureLabel, t('tabs.configureFull')]]
+      : []) as [RunView, React.ReactNode, string][]),
   ]
   const availableViews = new Set(tabs.map((t) => t[0]))
   const view: RunView = availableViews.has(activeView) ? activeView : 'overview'
@@ -2312,6 +2534,29 @@ function RunDetailPageInner() {
             isStreaming={attrs.status === 'planning' && !gate}
             logComplete={planLogComplete}
             onRefresh={() => loadPlanLog(true)}
+          />
+        )}
+
+        {/* Configure log (#2144). The per-host switch lives inside LogPanel
+            and appears from the log's own content, so nothing here has to know
+            whether the runner tagged it. */}
+        {view === 'configure' && (
+          <LogPanel
+            log={configureLog}
+            // Used only on the UNTAGGED path -- a configure from a runner that
+            // predates the callback. A tagged log cannot use it, because it is
+            // an incremental conversion of the raw bytes and still carries the
+            // prefixes; LogPanel recomputes in that case. Passing it anyway
+            // rather than `undefined` keeps the older-runner case on the same
+            // fast path as plan and apply.
+            precomputedHtml={configureHtml}
+            loading={configureLogLoading}
+            emptyMessage={t('log.configureEmpty')}
+            phase="configure"
+            engine={engine}
+            runId={runId}
+            isStreaming={attrs.status === 'configuring'}
+            onRefresh={() => loadConfigureLog(true)}
           />
         )}
 

@@ -1623,6 +1623,47 @@ Deriving the graph on the server (rather than shipping the raw, possibly multi-M
 
 **Required permission:** `read` on the workspace. Returns **404** when the run produced no JSON plan output.
 
+### Per-host results for a configure (#1928)
+
+An Ansible configure reports per **host**, not per resource, so a configure run carries a table of hosts rather than one status. See [ansible-configure.md](ansible-configure.md#what-a-configure-reports-one-row-per-host) for the feature guide.
+
+```
+GET /api/v1/runs/{run_id}/host-results                       # every host (workspace read)
+GET /api/v1/runs/{run_id}/host-events[?host=<name>]          # failures only (workspace read)
+GET /api/v1/runs/{run_id}/host-events/stream                 # every event, JSONL (STATE read)
+GET /api/v1/runs/{run_id}/host-events/stream?host=<name>     # that host's own object (STATE read)
+GET /api/v1/runs/{run_id}/host-events/payloads               # oversized-payload sidecar (STATE read)
+```
+
+**GET host-results** returns `{"data": [<resource>], "meta": {"pagination": {...}, "detail": {...}}}`, type `run-host-results`. Attributes: `host`, `status`, `ok`, `changed`, `failures`, `unreachable`, `skipped`, `rescued`, `ignored`, `saw-unreachable`, `reached`, `created-at`, `updated-at`.
+
+`meta.detail.state` says whether the per-task stream behind this summary still exists, so a client does not have to download it to find out — `available`, `reaped` (retention deleted it; the summary rows outlive the artifact), `none` (the run reported no hosts), or `unknown` (storage could not be asked). **`unknown` is not `none`**: "there is no detail" is a claim, and a backend that cannot answer must not be rendered as making it.
+
+Two of those need explaining, because taking them at face value gets the wrong answer:
+
+- **The list is the union of what ansible reported and what the run's resolved inventory named.** Ansible reports only the hosts it got to — under `serial:` with `any_errors_fatal:` a first-batch failure leaves every later host in no event and in no `PLAY RECAP`. A host from the inventory that ansible never mentioned comes back with `reached: false`, `status: not-reached` and **null** counters. Null rather than `0`: zero is a measurement and this is the absence of one. A consumer that treats a missing or null-counter host as a success is wrong in the one direction that matters.
+- **`saw-unreachable`, not `unreachable`, is the reachability signal.** With `ignore_unreachable: true` ansible reports `unreachable=0 ignored=1` while the unreachable hook fired, so the counter alone calls a dead host healthy. And reachability is not liveness either way: a host that is down still reports `ok` for any task needing no connection, so `status` must not be presented as a health check.
+
+`status` is derived server-side — `unreachable`, `failed`, `ignored-failure`, `changed`, `ok`, or `not-reached` — so no consumer re-derives it from the counters.
+
+**GET host-events** returns type `run-host-events` with `host`, `kind` (`failed` or `unreachable`), `task-name`, `task-action`, `task-uuid`, `play-name`, `ignored`, `message`, `payload-ref`, `sequence`, `created-at`. Only those two kinds are stored as rows; everything ansible reported is in the run's event-stream artifact. So an **empty list means nothing failed, not that nothing happened**.
+
+Order by `sequence` rather than `created-at`: under `forks` several hosts finish inside the same millisecond and the timestamps tie. `task-uuid` correlates events **within one run only** — ansible generates a fresh one per run of the same playbook — so the cross-run key is `task-name`, which is what the index is on. `payload-ref` is non-null when the result was too large to store inline and identifies it in the run's oversized-payload sidecar.
+
+**GET host-events/stream** returns the complete per-task event stream as JSONL — one JSON object per line, in the order ansible reported them — and **GET host-events/payloads** returns the sidecar a `payload-ref` points into, as JSONL of `{"ref": N, "payload": {…}}`.
+
+**`?host=<name>` serves that host's own object rather than filtering the run's.** The events are partitioned per host at ingest as well as kept whole, so a drill-down is one object fetch instead of a scan of a stream that is tens of MB at fleet scale. A partition is a byte-exact subsequence of the whole stream — the same lines, copied verbatim rather than re-serialised — so a reader parses either identically. It holds **everything** that happened to that host, not just its failures; those are the rows above.
+
+With `?host=`, the three-way below narrows to that host: a recap row for it and no object is a `410`, and no row at all is a `404`, because a run asked about a host it never reported on lost nothing.
+
+Partitions are deleted by artifact retention like every other run artifact, from the host list in `run_host_results` — the only artifact here whose key set is derived rather than fixed, which is safe precisely because nothing deletes those rows and the sweep touches storage only. (The oversized-payload sidecar is one object per run for the opposite reason: a payload *reference* exists only inside the stream, so nothing outside it could enumerate what was written.)
+
+Both are gated on **`state:read`, not `run:read`**, and the difference is the content rather than the shape. The two reads above serve counters and ansible's own failure text truncated at 2000 characters, which is the configure equivalent of a plan log and is served at the same tier for the same reason. These two carry `result._result` verbatim for every event including `ok` — each module's whole return value, so a `command`'s full stdout, a `uri` task's response body, whatever a lookup resolved. That is state-grade, and serving a full resolved document a tier below raw state is [GHSA-gwwq-5v7q-h3f4](https://github.com/mattrobinsonsre/terrapod/security/advisories/GHSA-gwwq-5v7q-h3f4). Ansible already censors a `no_log` task's result at source, which is the playbook author's own control over this.
+
+**A 410 is not a 404 here, and the difference is the point.** These objects live under artifact retention, so they are deleted while the per-host summary rows remain. `410 Gone` means it existed and has been removed; `404` means it was never written — no host reported, or for the sidecar, nothing spilled. Presenting a reaped stream as "nothing happened" is the specific failure the distinct status exists to prevent, because the run's own summary is still sitting beside it saying tasks ran. go-terrapod exposes `IsDetailReaped(err)` for exactly this branch.
+
+The runner protocol (runner-token, `configure`-phase, run_id-scoped) is `PUT .../artifacts/host-events` and `PUT .../artifacts/host-events-large`; the first also ingests the rows. Both are internal to the runner.
+
 ### Security Scan (#1036)
 
 The deterministic Checkov/Trivy IaC security-scan result for a run — the structural twin of the OPA policy endpoints. See [security-scanning.md](security-scanning.md) for the feature guide; the per-workspace config attributes (`security-scan-*`) are documented in the workspace attributes table above.

@@ -5,6 +5,8 @@ Provides consistent key naming for all stored artifacts.
 All keys are relative to the storage backend's configured prefix.
 """
 
+from urllib.parse import quote
+
 
 def state_index_key() -> str:
     """Key for the human-readable state index (break-glass DR recovery)."""
@@ -107,6 +109,69 @@ def resolved_inventory_key(workspace_id: str, run_id: str) -> str:
     from the same commit even if the branch moves between launch and execution.
     """
     return f"runs/{workspace_id}/{run_id}.inventory.json"
+
+
+def host_events_key(workspace_id: str, run_id: str) -> str:
+    """Key for a configure's per-host, per-task event stream (#1928).
+
+    Under `runs/` rather than `logs/`: this is a machine-read artifact of the run
+    like the resolved inventory beside it, not the human log, and the prefix is
+    already covered by the `run_vars` blob class so no new class is needed.
+
+    The whole run's stream. `host_events_host_key` partitions the same events per
+    host beside it, so a drill-down is one object fetch rather than a scan of
+    this one.
+
+    **An earlier revision of this docstring said the partition had been dropped
+    because "the retention sweep deletes a FIXED key list per run and has no
+    prefix enumeration, so N objects per run would leak for ever". That reason
+    was wrong**, and it is worth recording why rather than quietly deleting it:
+    the constraint is real and is what makes the oversized-payload sidecar one
+    object per run, because a payload REFERENCE is an integer that exists only
+    inside the stream, so nothing outside it can enumerate what was written. A
+    HOST is not like that. `run_host_results` holds one row per host per run,
+    nothing in the tree ever deletes those rows, and the sweep touches storage
+    only -- so the host set is queryable at reap time and the keys derive from
+    it. The two cases look alike and are not.
+    """
+    return f"runs/{workspace_id}/{run_id}.host-events.jsonl"
+
+
+def host_events_host_key(workspace_id: str, run_id: str, host: str) -> str:
+    """Key for ONE host's slice of the event stream (#1928).
+
+    Written at completion alongside `host_events_key`, which is what makes a
+    per-host drill-down a single object fetch instead of fetching the whole
+    run's stream and filtering it. At fleet scale that is the difference between
+    one host's ~100 KB and a stream of tens of MB.
+
+    The host is percent-encoded with nothing safe but the unreserved set, so a
+    name carrying a `/` cannot escape the run's prefix and invent a key under
+    another run. `.` stays literal, so an ordinary FQDN remains readable in a
+    bucket listing.
+
+    Deletable despite not being in `RUN_ARTIFACT_KEYS`, whose entries take only
+    `(workspace_id, run_id)`: the retention sweep derives the host set from this
+    run's `run_host_results` rows, which outlive every artifact. See
+    `host_events_key` for why that works here and not for the payload sidecar.
+    """
+    return f"runs/{workspace_id}/{run_id}.host-events.{quote(host, safe='')}.jsonl"
+
+
+def host_events_large_key(workspace_id: str, run_id: str) -> str:
+    """Key for the oversized payloads `host_events_key` references by id.
+
+    A single `gather_facts` result is 16.5 KB per host (measured on ansible-core
+    2.18.3; a Linux host with more mounts and NICs is larger), so the spill
+    threshold sits above it deliberately -- facts are the normal case. What lands
+    here is the exception: on one probe, three 140 KB command results moved
+    422 KB out of a stream that a host filter would otherwise have to scan,
+    leaving the main object at 62 KB.
+
+    ONE sidecar per run, not one per payload, for the retention reason in
+    `host_events_key`.
+    """
+    return f"runs/{workspace_id}/{run_id}.host-events-large.jsonl"
 
 
 def cost_estimate_key(workspace_id: str, run_id: str) -> str:

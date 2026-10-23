@@ -537,6 +537,10 @@
                   "value": "/tp/credentials"
                 },
                 {
+                  "name": "TP_EE_CALLBACK_DIR",
+                  "value": "/tp/callback"
+                },
+                {
                   "name": "TP_EE_TOKEN",
                   "valueFrom": {
                     "secretKeyRef": {
@@ -609,7 +613,7 @@
               "command": [
                 "/bin/sh",
                 "-c",
-                "mkdir -p /tp/tmp /tp/collections /tp/roles /tp/home /tp/inventory /tp/credentials && cp /usr/local/bin/terrapod-ee-agent /tp/terrapod-ee-agent"
+                "mkdir -p /tp/tmp /tp/collections /tp/roles /tp/home /tp/inventory /tp/credentials /tp/callback && cp /usr/local/bin/terrapod-ee-agent /tp/terrapod-ee-agent"
               ],
               "image": "ghcr.io/test/runner:latest",
               "imagePullPolicy": "IfNotPresent",
@@ -700,7 +704,9 @@
                   ]
                 },
                 "readOnlyRootFilesystem": true,
+                "runAsGroup": 1000,
                 "runAsNonRoot": true,
+                "runAsUser": 1000,
                 "seccompProfile": {
                   "type": "RuntimeDefault"
                 }
@@ -932,6 +938,10 @@
                   "value": "/tp/credentials"
                 },
                 {
+                  "name": "TP_EE_CALLBACK_DIR",
+                  "value": "/tp/callback"
+                },
+                {
                   "name": "TP_EE_TOKEN",
                   "valueFrom": {
                     "secretKeyRef": {
@@ -1045,7 +1055,7 @@
               "command": [
                 "/bin/sh",
                 "-c",
-                "mkdir -p /tp/tmp /tp/collections /tp/roles /tp/home /tp/inventory /tp/credentials && cp /usr/local/bin/terrapod-ee-agent /tp/terrapod-ee-agent"
+                "mkdir -p /tp/tmp /tp/collections /tp/roles /tp/home /tp/inventory /tp/credentials /tp/callback && cp /usr/local/bin/terrapod-ee-agent /tp/terrapod-ee-agent"
               ],
               "image": "ghcr.io/test/runner:latest",
               "imagePullPolicy": "IfNotPresent",
@@ -1136,7 +1146,9 @@
                   ]
                 },
                 "readOnlyRootFilesystem": true,
+                "runAsGroup": 1000,
                 "runAsNonRoot": true,
+                "runAsUser": 1000,
                 "seccompProfile": {
                   "type": "RuntimeDefault"
                 }
@@ -1364,6 +1376,10 @@
                   "value": "/tp/credentials"
                 },
                 {
+                  "name": "TP_EE_CALLBACK_DIR",
+                  "value": "/tp/callback"
+                },
+                {
                   "name": "TP_EE_TOKEN",
                   "valueFrom": {
                     "secretKeyRef": {
@@ -1436,7 +1452,7 @@
               "command": [
                 "/bin/sh",
                 "-c",
-                "mkdir -p /tp/tmp /tp/collections /tp/roles /tp/home /tp/inventory /tp/credentials && cp /usr/local/bin/terrapod-ee-agent /tp/terrapod-ee-agent"
+                "mkdir -p /tp/tmp /tp/collections /tp/roles /tp/home /tp/inventory /tp/credentials /tp/callback && cp /usr/local/bin/terrapod-ee-agent /tp/terrapod-ee-agent"
               ],
               "image": "ghcr.io/test/runner:latest",
               "imagePullPolicy": "IfNotPresent",
@@ -1527,7 +1543,9 @@
                   ]
                 },
                 "readOnlyRootFilesystem": true,
+                "runAsGroup": 1000,
                 "runAsNonRoot": true,
+                "runAsUser": 1000,
                 "seccompProfile": {
                   "type": "RuntimeDefault"
                 }
@@ -2347,6 +2365,10 @@
                   "value": "/tp/credentials"
                 },
                 {
+                  "name": "TP_EE_CALLBACK_DIR",
+                  "value": "/tp/callback"
+                },
+                {
                   "name": "TP_EE_TOKEN",
                   "valueFrom": {
                     "secretKeyRef": {
@@ -2419,7 +2441,7 @@
               "command": [
                 "/bin/sh",
                 "-c",
-                "mkdir -p /tp/tmp /tp/collections /tp/roles /tp/home /tp/inventory /tp/credentials && cp /usr/local/bin/terrapod-ee-agent /tp/terrapod-ee-agent"
+                "mkdir -p /tp/tmp /tp/collections /tp/roles /tp/home /tp/inventory /tp/credentials /tp/callback && cp /usr/local/bin/terrapod-ee-agent /tp/terrapod-ee-agent"
               ],
               "image": "ghcr.io/test/runner:latest",
               "imagePullPolicy": "IfNotPresent",
@@ -2510,7 +2532,9 @@
                   ]
                 },
                 "readOnlyRootFilesystem": true,
+                "runAsGroup": 1000,
                 "runAsNonRoot": true,
+                "runAsUser": 1000,
                 "seccompProfile": {
                   "type": "RuntimeDefault"
                 }
@@ -3013,6 +3037,10 @@
                   "value": "/tp/credentials"
                 },
                 {
+                  "name": "TP_EE_CALLBACK_DIR",
+                  "value": "/tp/callback"
+                },
+                {
                   "name": "TP_EE_TOKEN",
                   "valueFrom": {
                     "secretKeyRef": {
@@ -3085,7 +3113,7 @@
               "command": [
                 "/bin/sh",
                 "-c",
-                "mkdir -p /tp/tmp /tp/collections /tp/roles /tp/home /tp/inventory /tp/credentials && cp /usr/local/bin/terrapod-ee-agent /tp/terrapod-ee-agent"
+                "mkdir -p /tp/tmp /tp/collections /tp/roles /tp/home /tp/inventory /tp/credentials /tp/callback && cp /usr/local/bin/terrapod-ee-agent /tp/terrapod-ee-agent"
               ],
               "image": "ghcr.io/test/runner:latest",
               "imagePullPolicy": "IfNotPresent",
@@ -3176,7 +3204,9 @@
                   ]
                 },
                 "readOnlyRootFilesystem": true,
+                "runAsGroup": 1000,
                 "runAsNonRoot": true,
+                "runAsUser": 1000,
                 "seccompProfile": {
                   "type": "RuntimeDefault"
                 }
@@ -3391,6 +3421,10 @@
                   "value": "/tp/credentials"
                 },
                 {
+                  "name": "TP_EE_CALLBACK_DIR",
+                  "value": "/tp/callback"
+                },
+                {
                   "name": "TP_EE_TOKEN",
                   "valueFrom": {
                     "secretKeyRef": {
@@ -3463,7 +3497,7 @@
               "command": [
                 "/bin/sh",
                 "-c",
-                "mkdir -p /tp/tmp /tp/collections /tp/roles /tp/home /tp/inventory /tp/credentials && cp /usr/local/bin/terrapod-ee-agent /tp/terrapod-ee-agent"
+                "mkdir -p /tp/tmp /tp/collections /tp/roles /tp/home /tp/inventory /tp/credentials /tp/callback && cp /usr/local/bin/terrapod-ee-agent /tp/terrapod-ee-agent"
               ],
               "image": "ghcr.io/test/runner:latest",
               "imagePullPolicy": "IfNotPresent",
@@ -3554,7 +3588,9 @@
                   ]
                 },
                 "readOnlyRootFilesystem": true,
+                "runAsGroup": 1000,
                 "runAsNonRoot": true,
+                "runAsUser": 1000,
                 "seccompProfile": {
                   "type": "RuntimeDefault"
                 }

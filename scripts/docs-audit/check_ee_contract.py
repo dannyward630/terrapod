@@ -65,9 +65,54 @@ MIN_READERS = 2
 #: Likewise for the agent's own list, read out of Go source by regex.
 MIN_AGENT_BINARIES = 4
 
-#: Where the contract is stated in prose, and the bullet that states it.
-POLICY_PAGE = Path("docs/versioning-and-support.md")
-POLICY_BULLET = "- **runner \u2194 execution environment:**"
+#: Every place the contract is stated in PROSE, and the heading or bullet that
+#: states it, so a mention elsewhere on the page cannot satisfy the check.
+#:
+#: FIVE, because each is read by a different person at a different moment and
+#: every one of them has drifted at least once:
+#:
+#: * `docs/versioning-and-support.md` states it as the thing that makes an EE
+#:   insensitive to a Terrapod release;
+#: * `docs/runners.md` is what somebody BUILDING an image reads. It was ungated
+#:   and had drifted -- it still named the 1.x requirement ("a uid that can read
+#:   the shared volume") after #1928 narrowed it to uid 1000, so an operator
+#:   following it would have built an image the startup probe refuses;
+#: * `helm/terrapod/values.yaml` is what an operator reads at the moment they
+#:   configure this;
+#: * `services/terrapod/config.py` is the same statement on the config schema,
+#:   which is where it reaches an operator who never opens the chart;
+#: * `llms.txt` is what an AGENT reads, and it is the one that proves the gate
+#:   needed widening rather than the pages needing fixing: it was outside PROSE
+#:   when #1928 pinned the uid, so it went on telling an agent the contract was
+#:   "a uid that can read the shared volume" while the probe demanded 1000 --
+#:   and the sibling credential bullet still gave the WITHDRAWN REASONING for
+#:   group-readable files ("the EE sidecar deliberately pins no `runAsUser`"),
+#:   which by then was the opposite of the truth.
+#:
+#: Fixing the instances and leaving the gate at three is how the next one
+#: happens, so the gate grew with them.
+#: path -> (where the statement starts, where it ends). An explicit end rather
+#: than one inferred from the marker's shape, because two of these have no
+#: heading structure at all -- a YAML comment block and a Python string.
+PROSE: dict[Path, tuple[str, str]] = {
+    Path("docs/versioning-and-support.md"): (
+        "- **runner \u2194 execution environment:**",
+        "\n- **",
+    ),
+    Path("docs/runners.md"): ("#### What your image must provide", "\n#### "),
+    Path("helm/terrapod/values.yaml"): (
+        "# Each image must carry",
+        "execution_environments: {}",
+    ),
+    Path("services/terrapod/config.py"): (
+        "Operator-supplied execution environments as label -> image URI",
+        "availability_ttl_seconds",
+    ),
+    Path("llms.txt"): (
+        "- [Ansible Execution Environments]",
+        "\n- [",
+    ),
+}
 
 
 def main() -> int:
@@ -162,6 +207,32 @@ def main() -> int:
             # Plus anything it runs outright -- `ansible` is required by being
             # exec'd rather than by being looked up, which a list-only read misses.
             required |= set(re.findall(r'exec\.Command\(\s*"([^"]+)"', src))
+
+            # The uid is a requirement of a different KIND, and a derivation that
+            # only walks binaries is blind to it -- which is the shape of gate
+            # failure this repository keeps meeting. Derived from the agent's own
+            # constant so it cannot drift from what the probe enforces.
+            uid_decl = re.search(r"requiredUID\s*=\s*(\d+)", src)
+            required_uid = uid_decl.group(1) if uid_decl else None
+            if required_uid is None:
+                problems.append(
+                    "cannot find `requiredUID` in ee-agent/contract.go, so the uid the "
+                    "probe enforces cannot be compared with what the build and the docs "
+                    "promise"
+                )
+            # Matched as a TEST, not as a mention. A bare `1000 in text` is
+            # satisfied by any incidental occurrence -- a comment, an example,
+            # the failure message of a different check -- so deleting the real
+            # assertion survived it. Measured: it did.
+            elif not re.search(
+                rf'"\$uid"\s*=\s*"{required_uid}"', contract.read_text()
+            ):
+                problems.append(
+                    f"the agent requires uid {required_uid} at an EE's startup, but "
+                    f"{CONTRACT} does not TEST for it (expected a `[ \"$uid\" = "
+                    f"\"{required_uid}\" ]`), so one of our own images could pass its "
+                    "build and fail its own startup probe"
+                )
             if len(required) < MIN_AGENT_BINARIES:
                 problems.append(
                     f"only derived {len(required)} required binary/binaries from "
@@ -178,31 +249,66 @@ def main() -> int:
                     "of our own images could pass its build and fail its own startup probe"
                 )
 
-            # And the prose, which is what an operator building their own EE
-            # reads. Scoped to the bullet that states the contract, so a
-            # mention anywhere else in the page cannot satisfy it.
-            page = ROOT / POLICY_PAGE
-            if not page.is_file():
-                problems.append(f"{POLICY_PAGE} is missing; nothing states the EE contract")
-            else:
+            # And the prose -- every statement of it, because an operator
+            # building an EE reads one of them and has no way to know which is
+            # current. Scoped to the block that states the contract, so a
+            # mention elsewhere on the page cannot satisfy it.
+            for rel, (marker, terminator) in PROSE.items():
+                page = ROOT / rel
+                if not page.is_file():
+                    problems.append(f"{rel} is missing; it states the EE contract")
+                    continue
                 text = page.read_text()
-                start = text.find(POLICY_BULLET)
+                start = text.find(marker)
                 if start < 0:
                     problems.append(
-                        f"{POLICY_PAGE} no longer has the `{POLICY_BULLET}` bullet, so the "
-                        "contract an operator builds an EE against is stated nowhere"
+                        f"{rel} no longer has `{marker}`, so the contract an operator "
+                        "builds an EE against is not stated there any more"
                     )
-                else:
-                    end = text.find("\n- **", start + len(POLICY_BULLET))
-                    bullet = text[start : end if end > 0 else len(text)]
-                    absent = sorted(b for b in required if f"`{b}`" not in bullet)
-                    if absent:
-                        problems.append(
-                            f"{POLICY_PAGE}'s EE-contract bullet does not name "
-                            + ", ".join(absent)
-                            + ", which the agent requires at startup; an operator building "
-                            "an EE from that paragraph would build a non-conforming image"
-                        )
+                    continue
+                stop = text.find(terminator, start + len(marker))
+                block = text[start : stop if stop > 0 else len(text)]
+                absent = sorted(b for b in required if f"`{b}`" not in block)
+                if absent:
+                    problems.append(
+                        f"{rel} does not name "
+                        + ", ".join(absent)
+                        + ", which the agent requires at startup; an operator building an "
+                        "EE from that section would build a non-conforming image"
+                    )
+                # As a REQUIREMENT, not a mention. These sections legitimately
+                # contain the number several times -- a Dockerfile example, a
+                # `docker run --user`, the prose about a missing passwd entry --
+                # so a substring check passes with the requirement sentence
+                # gutted. Measured: changing "run as uid 1000" to "run as a uid"
+                # survived the substring form.
+                # The subject has to be the IMAGE. Two different requirements
+                # phrase alike -- "the image must run as uid 1000" and "`ansible`
+                # must be runnable as uid 1000" -- so a plain search is satisfied
+                # by the second while the first is gutted. Measured: it was, and
+                # the mutation that removes the image requirement from `llms.txt`
+                # SURVIVED until this excluded an `ansible` subject.
+                #
+                # `re.IGNORECASE` because `llms.txt` writes the requirement in
+                # CAPS for emphasis throughout. It costs nothing -- what is
+                # required is the whole phrase, not the number.
+                uid_claims = [
+                    m
+                    for m in re.finditer(
+                        rf"\b(?:run|runs|running|runnable|ability to run)\s+as\s+"
+                        rf"(?:the\s+)?uid\s+{required_uid}\b",
+                        block,
+                        re.IGNORECASE,
+                    )
+                    if not re.search(r"`?ansible`?\s*$", block[max(0, m.start() - 20) : m.start()])
+                ]
+                if required_uid and not uid_claims:
+                    problems.append(
+                        f"{rel} does not state that an EE must RUN AS uid {required_uid} "
+                        "(the number appearing somewhere in the section is not the same "
+                        "thing); an operator building an EE from it would build one that "
+                        "is refused at pod start"
+                    )
 
     if found < MIN_READERS:
         problems.append(

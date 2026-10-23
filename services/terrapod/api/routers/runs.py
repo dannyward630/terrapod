@@ -28,6 +28,7 @@ import asyncio
 import json
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC
 from typing import Literal
 
@@ -64,6 +65,7 @@ from terrapod.db.models import (
     PlanSummary,
     PlanSummaryMessage,
     Run,
+    RunHostResult,
     StateVersion,
     VCSConnection,
     Workspace,
@@ -76,6 +78,7 @@ from terrapod.services import (
     agent_pool_service,
     ansible_auth,
     ansible_ee_service,
+    host_results_service,
     inventory_resolve,
     plan_graph_service,
     pool_set,
@@ -90,6 +93,9 @@ from terrapod.storage import get_storage
 from terrapod.storage.keys import (
     apply_log_key,
     cost_estimate_key,
+    host_events_host_key,
+    host_events_key,
+    host_events_large_key,
     plan_json_output_key,
     plan_log_key,
 )
@@ -1577,6 +1583,379 @@ async def list_run_events(
         )
 
     return JSONResponse(content={"data": events})
+
+
+# ── Per-host results (#1928) ─────────────────────────────────────────────
+#
+# On `extensions_router`, which is mounted NATIVE-ONLY, rather than on `router`,
+# which is dual-mounted onto the TFE surface. No CLI consumes a configure's
+# per-host results -- they are not on `docs/tfe-cli-surface.md` -- so putting
+# them on `router` would grow the frozen compatibility surface by four routes
+# for no consumer, and would put them behind the engine filter every
+# TFE-mounted router carries (#1905), which an Ansible workspace is exactly the
+# wrong side of.
+
+
+def _host_result_json(row: RunHostResult, run: Run) -> dict:
+    """One host's summary.
+
+    `status` is derived here rather than stored, so one reader cannot disagree
+    with another about what the counters mean -- and `unreachable` comes off
+    `saw_unreachable`, because the recap counters cannot answer it once
+    `ignore_unreachable` is in play.
+    """
+    if row.saw_unreachable:
+        status = "unreachable"
+    elif row.failures:
+        status = "failed"
+    elif row.ignored:
+        status = "ignored-failure"
+    elif row.changed:
+        status = "changed"
+    else:
+        status = "ok"
+    return {
+        "id": f"rhr-{row.id}",
+        "type": "run-host-results",
+        "attributes": {
+            "host": row.host,
+            "status": status,
+            "ok": row.ok,
+            "changed": row.changed,
+            "failures": row.failures,
+            "unreachable": row.unreachable,
+            "skipped": row.skipped,
+            "rescued": row.rescued,
+            "ignored": row.ignored,
+            "saw-unreachable": row.saw_unreachable,
+            "reached": True,
+            "created-at": _rfc3339(row.created_at),
+            "updated-at": _rfc3339(row.updated_at),
+        },
+        "relationships": {
+            "run": {"data": {"id": f"run-{run.id}", "type": "runs"}},
+        },
+    }
+
+
+def _not_reached_json(host: str, run: Run) -> dict:
+    """A host the run targeted that ansible never reported on.
+
+    Not a cosmetic row. Measured on ansible-core 2.18.3: with `serial: 1` and
+    `any_errors_fatal: true` over four hosts failing in the first batch, the PLAY
+    RECAP, the callback stream and therefore this table all hold ONE host while
+    three were in scope. Rendering only what ansible reported would show that
+    run as a clean one-host success.
+
+    `null` counters rather than zeros, because zero is a measurement and this is
+    the absence of one.
+    """
+    return {
+        "id": f"rhr-{run.id}-{host}",
+        "type": "run-host-results",
+        "attributes": {
+            "host": host,
+            "status": "not-reached",
+            "ok": None,
+            "changed": None,
+            "failures": None,
+            "unreachable": None,
+            "skipped": None,
+            "rescued": None,
+            "ignored": None,
+            "saw-unreachable": False,
+            "reached": False,
+            "created-at": None,
+            "updated-at": None,
+        },
+        "relationships": {
+            "run": {"data": {"id": f"run-{run.id}", "type": "runs"}},
+        },
+    }
+
+
+async def _targeted_hosts(run: Run) -> set[str]:
+    """Every host the run's resolved inventory names, or an empty set.
+
+    The run's own artifact rather than the live inventory: it is pinned at run
+    creation (and re-resolved at a composite's hand-over), so it is what this
+    run actually targeted even after the estate has moved. An absent or
+    unreadable artifact yields nothing, which degrades to "show what ansible
+    reported" rather than failing a read.
+    """
+    from terrapod.storage import get_storage
+    from terrapod.storage.keys import resolved_inventory_key
+
+    key = resolved_inventory_key(str(run.workspace_id), str(run.id))
+    try:
+        raw = await get_storage().get(key)
+    except Exception:  # noqa: BLE001 - any storage error degrades the same way
+        return set()
+    if not raw:
+        return set()
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        return set()
+    hosts = document.get("hosts") if isinstance(document, dict) else None
+    return set(hosts.keys()) if isinstance(hosts, dict) else set()
+
+
+@extensions_router.get("/runs/{run_id}/host-results")
+async def list_run_host_results(
+    request: Request,
+    run_id: str = Path(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """Every host this run reported on, plus the ones it never reached (#1928).
+
+    Requires read on the workspace, like every other run sub-resource: a
+    configure's per-host outcome is no more sensitive than its log.
+
+    The host set is the UNION of what ansible reported and what the run's
+    resolved-inventory artifact names, because neither alone is the answer --
+    see `_not_reached_json`.
+
+    **`meta.detail` tells a reader whether the per-task stream is still there,
+    so it does not have to download it to find out.** #1928's acceptance asks
+    that "where retention has expired the detail, the UI SAYS SO rather than
+    rendering an empty panel", and a client cannot say so from this response
+    alone: the summary rows outlive the artifact, so the panel looks complete
+    while the detail behind it is gone.
+
+    The alternative was for the client to probe `host-events/stream`, which is
+    worse in two ways -- it is a download of unbounded size to answer a
+    yes/no question, and it is gated on `state:read`, so a run-tier reader
+    would get a 403 and could not tell "reaped" from "not allowed to look".
+    One `exists()` here costs a single stat and answers it for everyone.
+
+    `unknown` is deliberate rather than a fallback to `none`: a storage backend
+    that cannot answer must not be reported as "there is no detail", which is
+    the one reading that would make the UI say the opposite of the truth.
+    """
+    run = await _get_run(run_id, db)
+    await _require_run_ws_capability(run, cap.RUN_READ, user, db, request=request)
+
+    rows = await host_results_service.list_results(db, run)
+    reported = {row.host for row in rows}
+    entries = [_host_result_json(row, run) for row in rows]
+    entries += [
+        _not_reached_json(host, run) for host in sorted(await _targeted_hosts(run) - reported)
+    ]
+    entries.sort(key=lambda e: e["attributes"]["host"])
+
+    meta = build_meta(len(entries), 1, len(entries) or 1)
+    meta["detail"] = {"state": await _detail_state(run, bool(rows))}
+    return JSONResponse(content={"data": entries, "meta": meta})
+
+
+async def _detail_state(run: Run, reported: bool) -> str:
+    """`available` | `reaped` | `none` | `unknown` for the per-task stream.
+
+    Derived from the same two facts the artifact route's three-way uses -- the
+    object's presence and whether any host was reported -- so the summary read
+    and the artifact read cannot disagree about which case this run is in.
+    Two producers of that judgement is how they come to.
+    """
+    if not reported:
+        return "none"
+    try:
+        exists = await get_storage().exists(host_events_key(str(run.workspace_id), str(run.id)))
+    except Exception:
+        # Never downgrade to "none": a backend that cannot answer must not be
+        # rendered as "this run has no detail", which reads as a fact.
+        logger.warning("host event detail state unknown", run_id=str(run.id), exc_info=True)
+        return "unknown"
+    return "available" if exists else "reaped"
+
+
+@extensions_router.get("/runs/{run_id}/host-events")
+async def list_run_host_events(
+    request: Request,
+    run_id: str = Path(...),
+    host: str = Query("", description="Only this host's events."),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    """A run's failure and unreachable events, optionally for one host (#1928).
+
+    Only those two kinds are rows; everything ansible reported is in the run's
+    event-stream artifact. So an empty list means "nothing failed", not "nothing
+    happened", and a reader showing it must say which.
+    """
+    run = await _get_run(run_id, db)
+    await _require_run_ws_capability(run, cap.RUN_READ, user, db, request=request)
+
+    rows = await host_results_service.list_events(db, run, host=host or None)
+    entries = [
+        {
+            "id": f"rhe-{row.id}",
+            "type": "run-host-events",
+            "attributes": {
+                "host": row.host,
+                "kind": row.kind,
+                "task-name": row.task_name,
+                "task-action": row.task_action,
+                "task-uuid": row.task_uuid,
+                "play-name": row.play_name,
+                "ignored": row.ignored,
+                "message": row.msg,
+                "payload-ref": row.payload_ref,
+                "sequence": row.seq,
+                "created-at": _rfc3339(row.created_at),
+            },
+            "relationships": {
+                "run": {"data": {"id": f"run-{run.id}", "type": "runs"}},
+            },
+        }
+        for row in rows
+    ]
+    return JSONResponse(
+        content={"data": entries, "meta": build_meta(len(entries), 1, len(entries) or 1)}
+    )
+
+
+async def _host_event_artifact(
+    key: str, *, ever_existed: Callable[[], Awaitable[bool]], absent: str
+) -> RedirectResponse:
+    """302 to a host-event object, distinguishing REAPED from NEVER WRITTEN.
+
+    #1928's acceptance requires that "where retention has expired the detail,
+    the UI SAYS SO rather than rendering an empty panel" -- so those two cases
+    must not arrive as the same status. They do under the obvious
+    implementation, because both present as a missing object.
+
+    `410 Gone` is the reaped case and is semantically exact: it was here and was
+    deliberately removed, which is the one thing a 404 cannot tell a reader.
+    `plan_json_output` collapses both into 404 and can afford to, because a plan
+    JSON's absence needs no explanation; a host-event stream's does, since the
+    run's own summary is still sitting beside it saying tasks ran.
+
+    `ever_existed` is DERIVED by each caller rather than flagged on the run. A
+    flag is a second thing to keep true, and the belt-and-braces comment on
+    `plan_json_output` records exactly what that costs: retention deleting the
+    artifact while leaving the flag intact, so the flag says yes and the object
+    is gone.
+
+    It is passed as a CALLABLE and awaited only when the object is MISSING. The
+    happy path is every ordinary read and has no use for the answer -- the object
+    being there settles it -- so probing eagerly would spend a query per read to
+    choose between two statuses neither of which is being returned.
+    """
+    storage = get_storage()
+    if await storage.exists(key):
+        url = await storage.presigned_get_url(key)
+        return RedirectResponse(url=url.url, status_code=302)
+    if await ever_existed():
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "The per-task event detail for this run has been removed by artifact "
+                "retention. The per-host summary and any failures are kept in the "
+                "database and are still available."
+            ),
+        )
+    raise HTTPException(status_code=404, detail=absent)
+
+
+@extensions_router.get("/runs/{run_id}/host-events/stream")
+async def download_run_host_event_stream(
+    request: Request,
+    run_id: str = Path(...),
+    host: str = Query("", description="Only this host's slice of the stream."),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> RedirectResponse:
+    """Everything ansible reported, as JSONL (#1928).
+
+    **Gated on `state:read`, NOT `run:read`, and the difference is the
+    content.** The two sibling routes serve the recap counters and the failure
+    rows, whose `message` is ansible's own failure text truncated at 2000
+    characters -- the configure equivalent of a plan log, which is served at
+    `run:read` for the same reason. This object is not that: the callback writes
+    `result._result` VERBATIM for every event including `ok`, so it carries each
+    module's complete return value -- a `command`'s full stdout, a `uri` task's
+    response body, whatever a lookup resolved.
+
+    That is state-grade, and GHSA-gwwq-5v7q-h3f4 is the precedent for exactly
+    this mistake: serving a full resolved document one tier below raw state
+    handed a read-tier user what the `state:read` gate exists to withhold.
+
+    Not redacted to serve it lower instead, for the reason recorded there: a
+    redacted second artifact is another thing to keep correct for ever. Ansible
+    already censors a `no_log` task's result at source, which is the operator's
+    own control over this and the one a playbook author expects to work.
+
+    **`?host=` serves that host's own object rather than filtering this one**,
+    which is the point of the partition #1928 asks for: a drill-down is one
+    object fetch instead of a scan of a stream that is tens of MB at fleet
+    scale. The partition is a byte-exact subsequence, so a reader parses either
+    the same way.
+
+    One route rather than a second, because the three-way below is the whole
+    subtlety and is identical for both: duplicating it is how the two come to
+    disagree about what a 410 means.
+    """
+    run = await _get_run(run_id, db)
+    await _require_run_ws_capability(run, cap.STATE_READ, user, db, request=request)
+
+    # A recap row per host is written when the stream is ingested, so rows
+    # present means a stream was stored -- which is what separates "reaped" from
+    # "this run reported no hosts". With `?host=`, the question narrows to that
+    # one host: a row for it means it HAD a partition, so a missing object is a
+    # retention event, while no row means the run never reported on it and
+    # nothing was lost.
+    async def _reported() -> bool:
+        rows = await host_results_service.list_results(db, run)
+        if not host:
+            return bool(rows)
+        return any(row.host == host for row in rows)
+
+    if host:
+        return await _host_event_artifact(
+            host_events_host_key(str(run.workspace_id), str(run.id), host),
+            ever_existed=_reported,
+            absent=f"This run reported nothing for host {host!r}.",
+        )
+    return await _host_event_artifact(
+        host_events_key(str(run.workspace_id), str(run.id)),
+        ever_existed=_reported,
+        absent="This run reported no hosts.",
+    )
+
+
+@extensions_router.get("/runs/{run_id}/host-events/payloads")
+async def download_run_host_event_payloads(
+    request: Request,
+    run_id: str = Path(...),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> RedirectResponse:
+    """The spill sidecar an oversized payload is referenced into (#1928).
+
+    Same `state:read` gate and for the same reason -- more so, since a payload
+    reaches this file precisely by being too large to inline, so it is the
+    biggest module output the run produced.
+
+    `ever_existed` derives from a row carrying a `payload_ref`: the sidecar is
+    written only when something spilled, so a run where nothing did has no
+    object and that is not a retention event. Reading it off the rows rather
+    than off the stream's presence matters because the two are reaped together
+    but written independently.
+    """
+    run = await _get_run(run_id, db)
+    await _require_run_ws_capability(run, cap.STATE_READ, user, db, request=request)
+
+    async def _spilled() -> bool:
+        rows = await host_results_service.list_events(db, run)
+        return any(row.payload_ref is not None for row in rows)
+
+    return await _host_event_artifact(
+        host_events_large_key(str(run.workspace_id), str(run.id)),
+        ever_existed=_spilled,
+        absent="No payload from this run was large enough to be stored separately.",
+    )
 
 
 # ── Plan & Apply Details ─────────────────────────────────────────────────

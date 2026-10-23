@@ -118,6 +118,12 @@ _EE_INVENTORY_DIR = f"{_EE_SHARED_DIR}/inventory"
 #: `/tmp` -- where the PVC-tempfile rule otherwise sends runner tempfiles -- is
 #: materialised correctly and invisible to the one process that must read it.
 _EE_CREDENTIALS_DIR = f"{_EE_SHARED_DIR}/credentials"
+
+#: Where the host-event callback plugin is placed and where it writes (#1928).
+#: On the shared volume for the same reason as the inventory: the plugin runs
+#: inside the EE, which mounts only this volume and the workspace, and the
+#: orchestrator has to read back what it wrote.
+_EE_CALLBACK_DIR = f"{_EE_SHARED_DIR}/callback"
 #: The group both containers reach the shared volumes through. The orchestrator
 #: runs 1000:1000; our own EE runs 1000:0; an operator's EE runs whatever its
 #: image says. `fsGroup` is what makes all three work: kubelet chowns every
@@ -277,23 +283,38 @@ def _add_vault_file_mounts(
 
 
 def _ee_security_context() -> dict:
-    """The EE sidecar's securityContext -- and what it deliberately omits.
+    """The EE sidecar's securityContext.
 
-    No `runAsUser` and no `runAsGroup`. The contract an EE must meet is "a uid
-    able to read the shared volume", and `fsGroup` is what satisfies it for any
-    uid, so pinning 1000 here would buy nothing and would break an operator's
-    image whose files belong to a different user. `runAsNonRoot` stays, because
-    we do require that much: an image whose USER is root fails to start with
-    kubelet saying so, which is a legible refusal rather than a silent
-    privilege.
+    **`runAsUser` and `runAsGroup` are PINNED to the shared uid (#1928).** This
+    used to omit them deliberately, on the grounds that the contract was "a uid
+    able to read the shared volume" and `fsGroup` satisfied that for any uid.
+    The cost of that generality was that every file either container writes for
+    the other had to be GROUP-READABLE, because the two uids could differ -- and
+    group-readable is a wider grant than the work needs when the two are in fact
+    always the same.
 
-    `readOnlyRootFilesystem` stays too. Everything ansible writes is redirected
-    under the shared volume by `_ee_env`, so an EE needs no writable path of its
-    own -- which is the property that keeps the contract to four binaries on
+    Pinning instead lets the orchestrator and the EE exchange files at `0600`:
+    owner-only, with the group bit no longer carrying any of the contract. The
+    volume is a pod-scoped `emptyDir`, so group-readable was never reachable
+    from outside this pod either way; this is a narrowing rather than a fix for
+    an exposure.
+
+    **It narrows the contract, which is a breaking change for an
+    operator-supplied EE whose image runs as another uid**, and is recorded as
+    one in `docs/upgrading-to-2.0.md`. The agent asserts it at the startup probe,
+    so such an image fails at pod start naming the uid rather than part way
+    through a playbook on an unreadable file.
+
+    `runAsNonRoot` stays, redundant now but kept as the independent statement it
+    always was. `readOnlyRootFilesystem` stays too: everything ansible writes is
+    redirected under the shared volume by `_ee_env`, so an EE needs no writable
+    path of its own -- the property that keeps the contract to five binaries on
     PATH.
     """
     return {
         "runAsNonRoot": True,
+        "runAsUser": _EE_FS_GROUP,
+        "runAsGroup": _EE_FS_GROUP,
         "readOnlyRootFilesystem": True,
         "allowPrivilegeEscalation": False,
         "capabilities": {"drop": ["ALL"]},
@@ -424,6 +445,7 @@ def _add_execution_environment(
             {"name": "TP_EE_ROLES_DIR", "value": _EE_ROLES_DIR},
             {"name": "TP_EE_INVENTORY_DIR", "value": _EE_INVENTORY_DIR},
             {"name": "TP_EE_CREDENTIALS_DIR", "value": _EE_CREDENTIALS_DIR},
+            {"name": "TP_EE_CALLBACK_DIR", "value": _EE_CALLBACK_DIR},
             {
                 "name": _EE_TOKEN_ENV,
                 "valueFrom": {
@@ -447,7 +469,7 @@ def _add_execution_environment(
                 "/bin/sh",
                 "-c",
                 f"mkdir -p {_EE_TMPDIR} {_EE_COLLECTIONS_DIR} {_EE_ROLES_DIR} {_EE_HOME} "
-                f"{_EE_INVENTORY_DIR} {_EE_CREDENTIALS_DIR} "
+                f"{_EE_INVENTORY_DIR} {_EE_CREDENTIALS_DIR} {_EE_CALLBACK_DIR} "
                 f"&& cp {_EE_AGENT_SRC} {_EE_AGENT_PATH}",
             ],
             "securityContext": {

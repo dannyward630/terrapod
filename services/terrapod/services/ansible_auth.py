@@ -70,26 +70,32 @@ import re
 from typing import Any
 
 #: The mode for ANY file on the EE's shared volume that carries credential
-#: material: owner read/write plus GROUP READ, and nothing for other.
+#: material: owner read/write, and nothing for group or other.
 #:
-#: The group bit is load-bearing rather than lax.
-#: `job_template._ee_security_context` deliberately sets no `runAsUser` on the
-#: EE sidecar -- its docstring says pinning 1000 "would break an operator's
-#: image whose files belong to a different user", and `fsGroup` is what
-#: satisfies the contract "a uid able to read the shared volume" for ANY uid.
-#: `fsGroup` grants access through the GROUP, which `0600` excludes, so `0600`
-#: would work only for an EE running as uid 1000 -- ours -- and an
-#: operator-supplied EE on any other uid would fail to read its own credentials
-#: after the configure had started. "Other" still gets nothing: the group is the
-#: pod's, so group-readable means this one Job's containers.
+#: Owner-only is reachable because the EE runs as the SAME uid as the
+#: orchestrator: `job_template._ee_security_context` pins `runAsUser` to 1000,
+#: so there is exactly one reader and it is us.
 #:
-#: **One producer, because there are now two kinds of file that need it** and
-#: they are written by different modules. The credential phase writes the key
+#: This was `0640` and the group bit was load-bearing: `fsGroup` granted access
+#: through the GROUP, so `0600` would have worked only for an EE running as uid
+#: 1000 and an operator-supplied EE on another uid would have failed to read its
+#: own credentials after the configure had started. **That premise is gone**:
+#: `_ee_security_context` pins `runAsUser` to 1000 (#1928), so there is no longer
+#: a reader that does not share our uid -- and these are the files it would be
+#: worst to leave open, holding SSH private keys, connection passwords and vault
+#: passphrases.
+#:
+#: The narrowing is recorded in `docs/upgrading-to-2.0.md`: an operator EE that
+#: cannot run as 1000 is refused at the startup probe rather than meeting this
+#: as an unreadable file mid-playbook.
+#:
+#: **One producer, because there are two kinds of file that need it** and they
+#: are written by different modules. The credential phase writes the key
 #: material; the inventory renderer writes a document that carries
 #: `ansible_password` and `ansible_become_password` as VARIABLES, because
 #: ansible has no `ansible_password_file` and a connection password can only be
 #: a variable. Two copies of this number is how one of them ends up `0644`.
-CREDENTIAL_FILE_MODE = 0o640
+CREDENTIAL_FILE_MODE = 0o600
 
 MACHINE_CATEGORY = "ansible_machine_auth"
 VAULT_CATEGORY = "ansible_vault_auth"
